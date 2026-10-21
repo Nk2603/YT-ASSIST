@@ -12,3 +12,4 @@ faiss-cpu
 langchain-community
 streamlit
 youtube-transcript-api
+reportlab

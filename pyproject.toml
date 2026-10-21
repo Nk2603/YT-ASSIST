@@ -1,7 +1,7 @@
-[project]
+[YT-RAG-Assist]
 name = "langchain-rag-project"
 version = "0.1.0"
-description = "Add your description here"
+description = "Asked your queries to the content of youtube videos and generate study notes"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
