@@ -1275,7 +1275,6 @@ if st.session_state.generated_notes:
                 )
 
                 st.iframe(preview_html, height=1100, scrolling=True)
-
             except Exception as exc:
 
                 st.error(
