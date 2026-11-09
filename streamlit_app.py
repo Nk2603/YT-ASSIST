@@ -1274,7 +1274,12 @@ if st.session_state.generated_notes:
                     diagram_images=st.session_state.generated_diagrams,
                 )
 
-                st.iframe(preview_html, height=1100, scrolling=True)
+                components.html(
+                    preview_html,
+                    height=1100,
+                    scrolling=True,
+                )
+
             except Exception as exc:
 
                 st.error(

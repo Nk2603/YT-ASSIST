@@ -1,14 +1,16 @@
+import html
+import base64
 import os
 import re
 import json
-import base64
+import textwrap
 import tempfile
 from io import BytesIO
 from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from langchain_groq import ChatGroq
 from langchain_community.document_loaders import YoutubeLoader
@@ -23,60 +25,51 @@ from pdf_generator import create_study_notes_pdf
 
 
 # ============================================================
-# OPTIONAL VIDEO / VISION DEPENDENCIES
-# ============================================================
-
-try:
-    import cv2
-except ImportError:
-    cv2 = None
-
-try:
-    import yt_dlp
-except ImportError:
-    yt_dlp = None
-
-try:
-    from langchain_google_genai import ChatGoogleGenerativeAI
-except ImportError:
-    ChatGoogleGenerativeAI = None
-
-
-# ============================================================
 # CONFIGURATION
 # ============================================================
 
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
+FONT_DIR = BASE_DIR / "fonts"
 
 YOUTUBE_URL = "https://youtu.be/p4pHsuEf4Ms?t=9"
 DEFAULT_YOUTUBE_URL = YOUTUBE_URL
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 LLM_MODEL = "openai/gpt-oss-120b"
-VISION_MODEL = "gemini-2.5-flash"
 
 # RAG settings
 CHUNK_SIZE = 1800
 CHUNK_OVERLAP = 150
 RETRIEVER_K = 5
 
-# Study notes settings
+# Notes settings
 SUMMARY_CHUNK_SIZE = 7500
 SUMMARY_CHUNK_OVERLAP = 250
 SUMMARIES_PER_NOTES_BATCH = 3
 MAX_CHAT_QUESTIONS = 15
 
-# Video visual settings
+# Standard diagram settings
+MAX_DIAGRAMS = 5
+MAX_DIAGRAM_NODES = 8
+DIAGRAM_WIDTH = 1500
+DIAGRAM_NODE_HEIGHT = 150
+DIAGRAM_VERTICAL_GAP = 95
+
+# Premium video analysis settings
+# These are reserved for a future Premium Notes workflow.
 MAX_VIDEO_FRAMES = 18
 MAX_VIDEO_DOWNLOAD_MB = 180
-MAX_DIAGRAMS = 5
-MIN_VISUAL_CONFIDENCE = 0.65
-
-# Image settings
 MAX_FRAME_WIDTH = 1200
 JPEG_QUALITY = 85
+VISION_MODEL = "gemini-2.5-flash"
+
+SUPPORTED_LANGUAGES = {
+    "English",
+    "Hindi",
+    "Hinglish",
+}
 
 
 # ============================================================
@@ -101,7 +94,7 @@ def get_llm():
 
 
 def response_to_text(response):
-    """Convert model responses into plain text."""
+    """Convert LangChain responses into plain text."""
 
     content = getattr(response, "content", response)
 
@@ -185,7 +178,8 @@ def initialize_rag_chain(youtube_url):
 
     if not chunks:
         raise ValueError(
-            "The transcript could not be divided into searchable sections."
+            "The transcript could not be divided "
+            "into searchable sections."
         )
 
     google_api_key = os.getenv("GOOGLE_API_KEY")
@@ -218,13 +212,19 @@ Answer the user's question using the supplied transcript context.
 
 Rules:
 - Use the transcript as your primary source.
-- Do not invent facts or quotations.
-- If the answer is not supported by the transcript, say so clearly.
+- Use general knowledge when it helps explain a concept,
+  but clearly distinguish it from information in the video.
+- Do not invent quotations or claim that the video said something
+  when it is not present in the transcript.
+- If something is not covered in the transcript, explain that.
 - Respond in the same language as the user's question.
 - Use simple English, Hindi, or natural Hinglish.
 - Explain technical terms clearly.
-- Use examples when they help understanding.
+- Use examples when they improve understanding.
+- Include useful facts or additional context when relevant.
 - Structure longer answers with headings and bullet points.
+- Use mathematical notation for formulas when appropriate.
+- Preserve chemical formulas and reaction coefficients.
 
 Transcript context:
 {context}
@@ -288,6 +288,7 @@ def build_questions_context(chat_history):
 # ============================================================
 
 def get_language_instruction(language):
+
     instructions = {
         "English": """
 Write in clear, simple English.
@@ -316,7 +317,60 @@ Avoid excessively informal language.
 
     return instructions[language]
 
+def get_diagram_language_instruction(language):
+    """
+    Diagram label language:
+    English  -> English
+    Hindi    -> Hindi (Devanagari)
+    Hinglish -> English
+    """
 
+    instructions = {
+        "English": """
+Write ALL diagram text in clear English.
+
+This includes:
+- Diagram title
+- Node labels
+- Node descriptions
+- Connection labels
+- Diagram descriptions
+
+Do not use Hindi or Hinglish.
+""",
+
+        "Hindi": """
+Write ALL diagram text in natural Hindi using Devanagari script.
+
+This includes:
+- Diagram title
+- Node labels
+- Node descriptions
+- Connection labels
+- Diagram descriptions
+
+Standard technical terms such as API, CPU, RAM, Database,
+Machine Learning and HTTP may remain in English where appropriate.
+
+Do not write Hindi using Roman letters.
+""",
+
+        "Hinglish": """
+Write ALL diagram text in clear English.
+
+This includes:
+- Diagram title
+- Node labels
+- Node descriptions
+- Connection labels
+- Diagram descriptions
+
+Even though the study notes are in Hinglish,
+diagram labels must remain in English.
+"""
+    }
+
+    return instructions.get(language, instructions["English"])
 # ============================================================
 # TRANSCRIPT SUMMARIZATION
 # ============================================================
@@ -366,11 +420,27 @@ Preserve:
 2. Definitions and explanations.
 3. Technical terminology.
 4. Important examples.
-5. Formulas, facts and numerical values.
-6. Processes and individual stages.
-7. Cause-and-effect relationships.
-8. Differences between related concepts.
-9. Important examination details.
+5. Mathematical formulas and their exact meaning.
+6. Chemical equations and reactions.
+7. Important facts and numerical values.
+8. Processes and individual stages.
+9. Cause-and-effect relationships.
+10. Differences between related concepts.
+11. Important examination details.
+
+MATHEMATICAL ACCURACY:
+- Preserve the original mathematical expression.
+- Do not change variables or numerical values.
+- Preserve fractions, powers, roots and Greek symbols.
+- Use LaTeX notation where the transcript supports it.
+
+CHEMICAL ACCURACY:
+- Preserve chemical formulas and subscripts.
+- Preserve reaction coefficients.
+- Preserve reaction direction.
+- Preserve reaction conditions when mentioned.
+- Do not invent or silently balance a reaction.
+- Do not change reactants or products.
 
 Rules:
 - Do not invent information.
@@ -423,6 +493,7 @@ def generate_notes_batch(
     language,
     questions_context,
 ):
+
     summary_text = "\n\n".join(
         f"VIDEO SUMMARY {index + 1}:\n{summary}"
         for index, summary in enumerate(summary_batch)
@@ -431,12 +502,31 @@ def generate_notes_batch(
     prompt = f"""
 You are an expert teacher and academic study-notes writer.
 
-Create a detailed section of study notes from the supplied summaries.
+Create detailed, accurate and student-friendly study notes
+from the supplied video summaries.
 
 This is NOTES SECTION {batch_number} OF {total_batches}.
 
 LANGUAGE:
 {get_language_instruction(language)}
+DIAGRAM LABEL LANGUAGE RULES:
+
+{get_diagram_language_instruction(language)}
+
+IMPORTANT:
+Every human-readable text field in the generated diagram JSON
+must follow the diagram language rules above.
+
+This applies to:
+- title
+- related_heading
+- description
+- every node label
+- every node details field
+- every connection label
+
+Node IDs must remain short ASCII identifiers.
+Do not translate node IDs.
 
 CONTENT REQUIREMENTS:
 1. Cover important concepts.
@@ -445,35 +535,79 @@ CONTENT REQUIREMENTS:
 4. Include important examples.
 5. Preserve technical terminology.
 6. Explain processes logically.
-7. Include formulas and their meanings.
-8. Include important facts and numerical values.
-9. Do not invent unsupported information.
-10. Avoid unnecessary repetition.
+7. Include mathematical formulas and their meanings.
+8. Include important chemical reactions.
+9. Include important facts and numerical values.
+10. Include useful examination points.
+11. Do not invent unsupported information.
+12. Avoid unnecessary repetition.
 
 FORMATTING:
 - Use Markdown headings.
+- Use # for the main document topic only when appropriate.
 - Use ## for main topics.
 - Use ### for subtopics.
 - Use short, readable paragraphs.
 - Use bullet points where helpful.
 - Use bold for important terms.
 - Use Markdown tables for comparisons.
-- Do not create flowcharts.
-- Do not insert ASCII diagrams.
+- Do not create ASCII diagrams.
+- Do not create Mermaid flowcharts.
 - Do not add a repeated cover title.
 
-FORMULAS AND REACTIONS:
-- Put important mathematical formulas in a separate blockquote.
-- Start formula blockquotes with [FORMULA].
-- Put important chemical reactions in a separate blockquote.
-- Start reaction blockquotes with [REACTION].
-- Explain symbols and conditions outside the formula block.
+MATHEMATICAL FORMULAS:
+- Use proper LaTeX notation.
+- Put important standalone formulas inside display math delimiters.
+- Use \\[ ... \\] for display equations.
+- Use \\( ... \\) for inline mathematical expressions.
+- Use \\frac{{a}}{{b}} for fractions.
+- Use ^ for superscripts.
+- Use _ for subscripts.
+- Preserve roots, Greek letters and mathematical operators.
+- Do not flatten fractions into ordinary text.
+- Explain every important variable after the formula.
+- Never change the original mathematical meaning.
 
 Example:
 
-> [FORMULA] Force = Mass × Acceleration
+[FORMULA]
+\\[
+F = ma
+\\]
 
-> [REACTION] 2H₂ + O₂ → 2H₂O
+Where:
+- F = Force
+- m = Mass
+- a = Acceleration
+
+CHEMICAL REACTIONS:
+- Use proper chemical notation.
+- Preserve subscripts and superscripts.
+- Preserve coefficients and reaction arrows.
+- Use LaTeX chemistry notation where appropriate.
+- Put important reactions in separate reaction blocks.
+- Use the [REACTION] marker before a reaction block.
+- Explain reactants, products and important conditions.
+- Explain catalysts or temperature conditions when mentioned.
+- Never invent a reaction.
+- Never silently change a chemical equation.
+- Do not balance a reaction unless the source provides a balanced equation
+  or explicitly asks for balancing.
+
+Example:
+
+> [REACTION]
+> \\(2H_2 + O_2 \\rightarrow 2H_2O\\)
+
+Explanation:
+- Reactants: Hydrogen and oxygen.
+- Product: Water.
+- Coefficients: 2, 1 and 2.
+
+FORMULA AND REACTION EXPLANATIONS:
+- Keep explanations outside the formula or reaction expression.
+- Explain symbols, variables, units and conditions.
+- Do not omit important explanations.
 
 IMPORTANT:
 - This section will be combined with other sections.
@@ -508,6 +642,7 @@ def generate_notes_from_summaries(
     language,
     chat_history,
 ):
+
     if not summaries:
         raise ValueError("No transcript summaries are available.")
 
@@ -572,38 +707,1026 @@ def generate_notes_from_summaries(
 
 
 # ============================================================
-# EXTRACT VIDEO FRAMES
+# NOTES HEADING EXTRACTION
 # ============================================================
 
-def extract_video_frames(youtube_url):
+def extract_note_headings(notes):
+    """Extract Markdown headings from generated notes."""
+
+    if not isinstance(notes, str):
+        return []
+
+    headings = []
+
+    for line in notes.splitlines():
+
+        match = re.match(
+            r"^\s{0,3}#{1,4}\s+(.+)$",
+            line,
+        )
+
+        if match:
+            heading = re.sub(
+                r"[*_`]",
+                "",
+                match.group(1),
+            ).strip()
+
+            if heading:
+                headings.append(heading)
+
+    return headings
+
+
+# ============================================================
+# DIAGRAM JSON PARSER
+# ============================================================
+
+def extract_json_from_response(response_text):
+    """Extract JSON from model output, including fenced responses."""
+
+    if not response_text:
+        return None
+
+    cleaned = response_text.strip()
+
+    cleaned = re.sub(
+        r"\A```(?:json)?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    cleaned = re.sub(
+        r"\s*```\Z",
+        "",
+        cleaned,
+    )
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    start_positions = [
+        position
+        for position in (
+            cleaned.find("{"),
+            cleaned.find("["),
+        )
+        if position >= 0
+    ]
+
+    if not start_positions:
+        return None
+
+    start = min(start_positions)
+
+    for end in range(len(cleaned), start, -1):
+
+        candidate = cleaned[start:end].strip()
+
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+    return None
+
+
+# ============================================================
+# DIAGRAM SPECIFICATION GENERATION
+# ============================================================
+
+def generate_diagram_specifications(
+    llm,
+    notes,
+    language,
+    visual_context="",
+):
     """
-    Extract frames distributed across the video.
+    Generate simple, topic-specific diagram specifications.
 
-    These are original video frames, not AI-generated images.
-
-    Optional dependencies:
-        pip install yt-dlp opencv-python-headless
-
-    If extraction fails, transcript-based notes still work.
+    Standard Notes uses transcript/notes content only.
+    No Gemini Vision or YouTube frame extraction is used.
     """
 
-    if yt_dlp is None or cv2 is None:
-        st.info(
-            "Video visual extraction is unavailable. "
-            "Install yt-dlp and opencv-python-headless "
-            "to include relevant visuals from the video."
+    headings = extract_note_headings(notes)
+
+    headings_text = "\n".join(
+        f"- {heading}"
+        for heading in headings[:40]
+    )
+
+    prompt = f"""
+You are an educational diagram designer.
+
+Create a small number of useful diagrams for the study notes.
+
+LANGUAGE:
+{get_language_instruction(language)}
+
+NOTES:
+{notes[:18000]}
+
+MAIN TOPICS:
+{headings_text}
+
+DIAGRAM REQUIREMENTS:
+- Generate at most {MAX_DIAGRAMS} diagrams.
+- Generate diagrams only when they genuinely improve understanding.
+- Use simple process diagrams, architecture diagrams,
+  block diagrams or basic concept diagrams.
+- Use only information supported by the notes.
+- Do not create scientific illustrations.
+- Do not create biological specimen drawings.
+- Do not create molecular structure illustrations.
+- Do not create decorative diagrams.
+- Do not create generic diagrams unrelated to the topic.
+- Do not invent components or process steps.
+- Keep node labels short and readable.
+- Use a maximum of {MAX_DIAGRAM_NODES} nodes per diagram.
+- Each diagram must match a specific notes heading.
+- Use connections to show meaningful relationships.
+- For processes, preserve the correct order.
+- For architecture, show meaningful component relationships.
+- For concept diagrams, show the main concept and its subtopics.
+
+Return valid JSON only.
+
+Required structure:
+
+{{
+  "diagrams": [
+    {{
+      "title": "Diagram title",
+      "related_heading": "Exact or closely matching notes heading",
+      "description": "One sentence explaining the diagram",
+      "diagram_type": "process",
+      "direction": "vertical",
+      "nodes": [
+        {{
+          "id": "A",
+          "label": "First step",
+          "details": "Short explanation"
+        }},
+        {{
+          "id": "B",
+          "label": "Second step",
+          "details": "Short explanation"
+        }}
+      ],
+      "connections": [
+        {{
+          "from": "A",
+          "to": "B",
+          "label": ""
+        }}
+      ]
+    }}
+  ]
+}}
+
+Allowed diagram_type values:
+- process
+- architecture
+- block
+- concept
+
+Allowed direction values:
+- vertical
+- horizontal
+
+If the notes do not need diagrams, return:
+{{"diagrams": []}}
+
+Return JSON only. Do not use Markdown code fences.
+"""
+
+    try:
+        response = llm.invoke(prompt)
+
+        result = extract_json_from_response(
+            response_to_text(response)
+        )
+
+        if isinstance(result, list):
+            diagrams = result
+
+        elif isinstance(result, dict):
+            diagrams = result.get("diagrams", [])
+
+        else:
+            return []
+
+        if not isinstance(diagrams, list):
+            return []
+
+        validated = []
+
+        for diagram in diagrams:
+
+            if not isinstance(diagram, dict):
+                continue
+
+            nodes = diagram.get("nodes", [])
+            connections = diagram.get("connections", [])
+
+            if not isinstance(nodes, list):
+                continue
+
+            if not isinstance(connections, list):
+                connections = []
+
+            nodes = [
+                node
+                for node in nodes[:MAX_DIAGRAM_NODES]
+                if (
+                    isinstance(node, dict)
+                    and str(node.get("id", "")).strip()
+                    and str(node.get("label", "")).strip()
+                )
+            ]
+
+            if len(nodes) < 2:
+                continue
+
+            valid_ids = {
+                str(node["id"]).strip()
+                for node in nodes
+            }
+
+            valid_connections = []
+
+            for connection in connections:
+
+                if not isinstance(connection, dict):
+                    continue
+
+                source = str(
+                    connection.get("from", "")
+                ).strip()
+
+                target = str(
+                    connection.get("to", "")
+                ).strip()
+
+                if (
+                    source in valid_ids
+                    and target in valid_ids
+                    and source != target
+                ):
+                    valid_connections.append({
+                        "from": source,
+                        "to": target,
+                        "label": str(
+                            connection.get("label", "")
+                        )[:60],
+                    })
+
+            if not valid_connections:
+                continue
+
+            diagram_type = str(
+                diagram.get("diagram_type", "block")
+            ).lower()
+
+            if diagram_type not in {
+                "process",
+                "architecture",
+                "block",
+                "concept",
+            }:
+                diagram_type = "block"
+
+            direction = str(
+                diagram.get("direction", "vertical")
+            ).lower()
+
+            if direction not in {"vertical", "horizontal"}:
+                direction = "vertical"
+
+            validated.append({
+                "title": str(
+                    diagram.get("title", "Concept Diagram")
+                )[:150],
+                "related_heading": str(
+                    diagram.get("related_heading", "")
+                )[:150],
+                "description": str(
+                    diagram.get("description", "")
+                )[:500],
+                "diagram_type": diagram_type,
+                "visual_type": diagram_type,
+                "direction": direction,
+                "nodes": nodes,
+                "connections": valid_connections,
+                "source": "Pillow-generated educational diagram",
+            })
+
+            if len(validated) >= MAX_DIAGRAMS:
+                break
+
+        return validated
+
+    except Exception as exc:
+        st.warning(
+            "Diagram specification generation failed. "
+            f"Notes will still be generated. Details: {exc}"
         )
         return []
+
+
+
+
+# ============================================================
+# BROWSER-BASED DIAGRAM RENDERING
+# Supports English, Hindi (Devanagari), and Hinglish labels.
+# Chromium handles complex text shaping without Pillow RAQM.
+# ============================================================
+
+def get_diagram_font_css():
+    """
+    Embed available Noto fonts directly into the HTML.
+    This avoids depending on fonts installed on the user's system.
+    """
+
+    font_definitions = [
+        ("NotoSans", "NotoSans-Regular.ttf", "400"),
+        ("NotoSans", "NotoSans-Bold.ttf", "700"),
+        ("NotoDevanagari", "NotoSansDevanagari-Regular.ttf", "400"),
+        ("NotoDevanagari", "NotoSansDevanagari-Bold.ttf", "700"),
+    ]
+
+    css = []
+
+    for family, filename, weight in font_definitions:
+        font_path = FONT_DIR / filename
+
+        if not font_path.exists():
+            continue
+
+        try:
+            encoded_font = base64.b64encode(
+                font_path.read_bytes()
+            ).decode("ascii")
+
+            css.append(
+                f"""
+                @font-face {{
+                    font-family: '{family}';
+                    src: url(data:font/ttf;base64,{encoded_font})
+                         format('truetype');
+                    font-weight: {weight};
+                    font-style: normal;
+                }}
+                """
+            )
+
+        except Exception as error:
+            print(f"Could not load font {filename}: {error}")
+
+    return "\n".join(css)
+
+
+def _safe_diagram_text(value):
+    """Safely convert model-generated values into HTML text."""
+
+    if value is None:
+        return ""
+
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False)
+
+    return html.escape(str(value))
+
+
+def build_diagram_html(specification):
+    """
+    Build a self-contained HTML diagram.
+
+    All diagram text is rendered by Chromium rather than Pillow.
+    The original diagram specification structure is preserved.
+    """
+
+    title = _safe_diagram_text(
+        specification.get("title", "Concept Diagram")
+    )
+
+    description = _safe_diagram_text(
+        specification.get("description", "")
+    )
+
+    diagram_type = str(
+        specification.get("diagram_type", "process")
+    ).lower()
+
+    direction = str(
+        specification.get("direction", "vertical")
+    ).lower()
+
+    nodes = specification.get("nodes", [])
+    connections = specification.get("connections", [])
+
+    if not isinstance(nodes, list):
+        nodes = []
+
+    if not isinstance(connections, list):
+        connections = []
+
+    # Limit the diagram to the configured maximum.
+    nodes = nodes[:8]
+
+    if not nodes:
+        return None
+
+    # Keep node IDs stable and safe for HTML attributes.
+    node_ids = set()
+    cleaned_nodes = []
+
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            continue
+
+        node_id = str(node.get("id", f"node_{index + 1}"))
+
+        # IDs are used only for connecting nodes.
+        node_id = re.sub(r"[^a-zA-Z0-9_-]", "_", node_id)
+
+        if not node_id:
+            node_id = f"node_{index + 1}"
+
+        if node_id in node_ids:
+            node_id = f"{node_id}_{index + 1}"
+
+        node_ids.add(node_id)
+
+        cleaned_nodes.append({
+            "id": node_id,
+            "label": _safe_diagram_text(
+                node.get("label", f"Step {index + 1}")
+            ),
+            "details": _safe_diagram_text(
+                node.get("details", "")
+            ),
+        })
+
+    nodes = cleaned_nodes
+
+    if not nodes:
+        return None
+
+    # Layout selection.
+    if direction == "horizontal" and diagram_type == "process":
+        columns = min(len(nodes), 4)
+    elif diagram_type in ("architecture", "concept"):
+        columns = 2 if len(nodes) > 1 else 1
+    else:
+        columns = 1
+
+    columns = max(1, columns)
+
+    # Only retain connections whose endpoints exist.
+    valid_connections = []
+
+    for connection in connections:
+        if not isinstance(connection, dict):
+            continue
+
+        source = str(connection.get("from", ""))
+        target = str(connection.get("to", ""))
+
+        if source in node_ids and target in node_ids:
+            valid_connections.append({
+                "from": source,
+                "to": target,
+                "label": _safe_diagram_text(
+                    connection.get("label", "")
+                ),
+            })
+
+    node_cards = []
+
+    for node in nodes:
+        details_html = ""
+
+        if node["details"]:
+            details_html = (
+                f'<div class="node-details">{node["details"]}</div>'
+            )
+
+        node_cards.append(
+            f"""
+            <div class="node-card" data-node-id="{node["id"]}">
+                <div class="node-label">{node["label"]}</div>
+                {details_html}
+            </div>
+            """
+        )
+
+    connections_json = json.dumps(
+        valid_connections,
+        ensure_ascii=False
+    )
+
+    font_css = get_diagram_font_css()
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+
+        <style>
+            {font_css}
+
+            * {{
+                box-sizing: border-box;
+            }}
+
+            body {{
+                margin: 0;
+                padding: 0;
+                background: #ffffff;
+            }}
+
+            #diagram {{
+                width: 1100px;
+                padding: 42px;
+                background: #ffffff;
+                color: #172033;
+                font-family:
+                    'NotoDevanagari',
+                    'NotoSans',
+                    'Nirmala UI',
+                    'Mangal',
+                    sans-serif;
+            }}
+
+            .diagram-title {{
+                font-size: 31px;
+                font-weight: 700;
+                text-align: center;
+                line-height: 1.45;
+                color: #25345c;
+                margin-bottom: 12px;
+            }}
+
+            .diagram-description {{
+                max-width: 900px;
+                margin: 0 auto 34px auto;
+                text-align: center;
+                font-size: 19px;
+                line-height: 1.65;
+                color: #586174;
+            }}
+
+            .diagram-canvas {{
+                position: relative;
+                width: 100%;
+                padding: 20px 10px;
+            }}
+
+            .nodes-grid {{
+                position: relative;
+                z-index: 2;
+                display: grid;
+                grid-template-columns:
+                    repeat({columns}, minmax(0, 1fr));
+                gap: 86px 90px;
+                align-items: stretch;
+            }}
+
+            .node-card {{
+                min-height: 125px;
+                padding: 25px 22px;
+                border: 2px solid #8c9de0;
+                border-radius: 17px;
+                background: #f2f5ff;
+                box-shadow: 0 5px 13px rgba(35, 50, 90, 0.10);
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                align-items: center;
+                text-align: center;
+                overflow-wrap: anywhere;
+                word-break: normal;
+            }}
+
+            .node-card:nth-child(3n + 2) {{
+                background: #eef9f6;
+                border-color: #69ad9b;
+            }}
+
+            .node-card:nth-child(3n) {{
+                background: #fff6e9;
+                border-color: #d9aa64;
+            }}
+
+            .node-label {{
+                font-size: 23px;
+                line-height: 1.5;
+                font-weight: 700;
+                color: #25345c;
+            }}
+
+            .node-details {{
+                margin-top: 11px;
+                font-size: 17px;
+                line-height: 1.55;
+                color: #48536a;
+                white-space: pre-wrap;
+            }}
+
+            .connections-layer {{
+                position: absolute;
+                inset: 0;
+                width: 100%;
+                height: 100%;
+                z-index: 1;
+                overflow: visible;
+                pointer-events: none;
+            }}
+
+            .connection-label {{
+                font-family:
+                    'NotoDevanagari',
+                    'NotoSans',
+                    'Nirmala UI',
+                    'Mangal',
+                    sans-serif;
+                font-size: 15px;
+                fill: #34415d;
+                text-anchor: middle;
+                dominant-baseline: middle;
+            }}
+        </style>
+    </head>
+
+    <body>
+        <div id="diagram">
+            <div class="diagram-title">{title}</div>
+
+            {f'<div class="diagram-description">{description}</div>' if description else ''}
+
+            <div class="diagram-canvas" id="diagram-canvas">
+
+                <svg
+                    class="connections-layer"
+                    id="connections-layer"
+                    aria-hidden="true"
+                >
+                    <defs>
+                        <marker
+                            id="arrowhead"
+                            markerWidth="10"
+                            markerHeight="10"
+                            refX="8"
+                            refY="3"
+                            orient="auto"
+                            markerUnits="strokeWidth"
+                        >
+                            <path
+                                d="M0,0 L0,6 L9,3 z"
+                                fill="#6676ad"
+                            />
+                        </marker>
+                    </defs>
+                </svg>
+
+                <div class="nodes-grid">
+                    {"".join(node_cards)}
+                </div>
+
+            </div>
+        </div>
+
+        <script>
+            const connections = {connections_json};
+
+            function drawConnections() {{
+                const canvas = document.getElementById("diagram-canvas");
+                const svg = document.getElementById("connections-layer");
+
+                const canvasRect = canvas.getBoundingClientRect();
+
+                svg.setAttribute("viewBox",
+                    `0 0 ${{canvasRect.width}} ${{canvasRect.height}}`
+                );
+
+                svg.setAttribute("width", canvasRect.width);
+                svg.setAttribute("height", canvasRect.height);
+
+                // Keep the arrow marker.
+                svg.innerHTML = `
+                    <defs>
+                        <marker
+                            id="arrowhead"
+                            markerWidth="10"
+                            markerHeight="10"
+                            refX="8"
+                            refY="3"
+                            orient="auto"
+                            markerUnits="strokeWidth"
+                        >
+                            <path
+                                d="M0,0 L0,6 L9,3 z"
+                                fill="#6676ad"
+                            />
+                        </marker>
+                    </defs>
+                `;
+
+                connections.forEach(connection => {{
+                    const source = document.querySelector(
+                        `[data-node-id="${{connection.from}}"]`
+                    );
+
+                    const target = document.querySelector(
+                        `[data-node-id="${{connection.to}}"]`
+                    );
+
+                    if (!source || !target) return;
+
+                    const sourceRect = source.getBoundingClientRect();
+                    const targetRect = target.getBoundingClientRect();
+
+                    const x1 =
+                        sourceRect.left + sourceRect.width / 2
+                        - canvasRect.left;
+
+                    const y1 =
+                        sourceRect.top + sourceRect.height / 2
+                        - canvasRect.top;
+
+                    const x2 =
+                        targetRect.left + targetRect.width / 2
+                        - canvasRect.left;
+
+                    const y2 =
+                        targetRect.top + targetRect.height / 2
+                        - canvasRect.top;
+
+                    const line = document.createElementNS(
+                        "http://www.w3.org/2000/svg",
+                        "line"
+                    );
+
+                    line.setAttribute("x1", x1);
+                    line.setAttribute("y1", y1);
+                    line.setAttribute("x2", x2);
+                    line.setAttribute("y2", y2);
+                    line.setAttribute("stroke", "#6676ad");
+                    line.setAttribute("stroke-width", "3");
+                    line.setAttribute("marker-end", "url(#arrowhead)");
+
+                    svg.appendChild(line);
+
+                    if (connection.label) {{
+                        const text = document.createElementNS(
+                            "http://www.w3.org/2000/svg",
+                            "text"
+                        );
+
+                        text.setAttribute(
+                            "x", (x1 + x2) / 2
+                        );
+
+                        text.setAttribute(
+                            "y", (y1 + y2) / 2 - 9
+                        );
+
+                        text.setAttribute("class", "connection-label");
+                        text.textContent = connection.label;
+
+                        svg.appendChild(text);
+                    }}
+                }});
+            }}
+
+            window.addEventListener("load", async () => {{
+                await document.fonts.ready;
+
+                // Wait for the browser to finish laying out the cards.
+                requestAnimationFrame(() => {{
+                    drawConnections();
+                }});
+            }});
+        </script>
+    </body>
+    </html>
+    """
+
+
+def render_single_diagram(specification, page=None):
+    """
+    Render one diagram as PNG bytes using Chromium.
+    """
+
+    from playwright.sync_api import sync_playwright
+
+    html_document = build_diagram_html(specification)
+
+    if not html_document:
+        return None
+
+    if page is not None:
+        page.set_content(
+            html_document,
+            wait_until="load",
+            timeout=30000
+        )
+
+        page.evaluate("""
+            async () => {
+                await document.fonts.ready;
+                await new Promise(resolve =>
+                    requestAnimationFrame(resolve)
+                );
+            }
+        """)
+
+        return page.locator("#diagram").screenshot(
+            type="png",
+            animations="disabled"
+        )
+
+    # Standalone fallback if this function is called independently.
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page(
+            viewport={"width": 1200, "height": 1000},
+            device_scale_factor=2
+        )
+
+        try:
+            page.set_content(html_document, wait_until="load")
+
+            page.evaluate("""
+                async () => {
+                    await document.fonts.ready;
+                    await new Promise(resolve =>
+                        requestAnimationFrame(resolve)
+                    );
+                }
+            """)
+
+            return page.locator("#diagram").screenshot(
+                type="png",
+                animations="disabled"
+            )
+
+        finally:
+            browser.close()
+
+
+def render_diagrams(diagrams):
+    """
+    Render diagram specifications while preserving the existing
+    output structure expected by generate_study_material()
+    and pdf_generator.py.
+    """
+
+    if not diagrams:
+        return []
+
+    rendered_diagrams = []
+
+    from playwright.sync_api import sync_playwright
+
+    browser = None
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+
+            page = browser.new_page(
+                viewport={"width": 1200, "height": 1000},
+                device_scale_factor=2
+            )
+
+            for index, specification in enumerate(
+                diagrams[:5],
+                start=1
+            ):
+                try:
+                    image_bytes = render_single_diagram(
+                        specification,
+                        page=page
+                    )
+
+                    if not image_bytes:
+                        continue
+
+                    rendered_diagrams.append({
+                        "number": index,
+                        "title": specification.get(
+                            "title",
+                            f"Diagram {index}"
+                        ),
+                        "related_heading": specification.get(
+                            "related_heading",
+                            ""
+                        ),
+                        "description": specification.get(
+                            "description",
+                            ""
+                        ),
+                        "diagram_type": specification.get(
+                            "diagram_type",
+                            "concept"
+                        ),
+                        "visual_type": specification.get(
+                            "diagram_type",
+                            "concept"
+                        ),
+                        "nodes": specification.get("nodes", []),
+                        "connections": specification.get(
+                            "connections",
+                            []
+                        ),
+                        "image": image_bytes,
+                        "source": "AI-generated concept illustration",
+                    })
+
+                except Exception as error:
+                    print(
+                        f"Diagram {index} rendering failed: {error}"
+                    )
+
+            browser.close()
+            browser = None
+
+    except Exception as error:
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+        st.warning(
+            "Diagram rendering could not be completed. "
+            "Please check that Playwright Chromium is installed. "
+            f"Details: {error}"
+        )
+
+    return rendered_diagrams
+
+def parse_diagram_material(raw_output):
+    """Compatibility helper for older code."""
+
+    result = extract_json_from_response(raw_output)
+
+    if isinstance(result, list):
+        return result
+
+    if isinstance(result, dict):
+        return result.get("diagrams", [])
+
+    return []
+
+
+# ============================================================
+# PREMIUM VIDEO FRAME ANALYSIS
+# ============================================================
+#
+# IMPORTANT:
+# These functions are intentionally isolated.
+#
+# Standard Notes does NOT call these functions.
+#
+# They are reserved for a future Premium Notes workflow:
+# - Original YouTube frame extraction.
+# - Gemini visual analysis.
+# - Selection of useful original video visuals.
+#
+# Dependencies are imported only when these functions are
+# explicitly called. This avoids unnecessary dependencies and
+# import overhead in the Standard Notes workflow.
+# ============================================================
+
+def extract_video_frames_premium(youtube_url):
+    """Extract original video frames for future Premium Notes."""
+
+    try:
+        import cv2
+        import yt_dlp
+
+    except ImportError as exc:
+        raise ImportError(
+            "Premium frame extraction requires "
+            "yt-dlp and opencv-python-headless."
+        ) from exc
 
     frames = []
 
     with tempfile.TemporaryDirectory(
-        prefix="yt_visual_reference_"
+        prefix="yt_premium_visuals_"
     ) as temp_dir:
 
         video_path = os.path.join(
             temp_dir,
-            "reference_video.mp4",
+            "premium_video.mp4",
         )
 
         options = {
@@ -615,7 +1738,9 @@ def extract_video_frames(youtube_url):
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
-            "max_filesize": MAX_VIDEO_DOWNLOAD_MB * 1024 * 1024,
+            "max_filesize": (
+                MAX_VIDEO_DOWNLOAD_MB * 1024 * 1024
+            ),
             "socket_timeout": 20,
             "retries": 1,
         }
@@ -630,8 +1755,9 @@ def extract_video_frames(youtube_url):
                 )
 
             if not os.path.exists(video_path):
+
                 candidates = list(
-                    Path(temp_dir).glob("reference_video.*")
+                    Path(temp_dir).glob("premium_video.*")
                 )
 
                 if not candidates:
@@ -655,8 +1781,6 @@ def extract_video_frames(youtube_url):
 
             duration = frame_count / fps
 
-            # Aim for approximately one frame per minute,
-            # with a maximum of MAX_VIDEO_FRAMES.
             sample_count = min(
                 MAX_VIDEO_FRAMES,
                 max(1, int(duration // 60)),
@@ -664,9 +1788,11 @@ def extract_video_frames(youtube_url):
 
             if sample_count == 1:
                 timestamps = [duration * 0.5]
+
             else:
                 timestamps = [
-                    duration * (index + 1) / (sample_count + 1)
+                    duration * (index + 1)
+                    / (sample_count + 1)
                     for index in range(sample_count)
                 ]
 
@@ -690,6 +1816,7 @@ def extract_video_frames(youtube_url):
                 )
 
                 if scale < 1:
+
                     frame = cv2.resize(
                         frame,
                         (
@@ -713,14 +1840,6 @@ def extract_video_frames(youtube_url):
                         "image": encoded.tobytes(),
                     })
 
-        except Exception as exc:
-            st.warning(
-                "Video-frame extraction could not be completed. "
-                "Transcript-based notes will continue. "
-                f"Details: {exc}"
-            )
-            return []
-
         finally:
             if capture is not None:
                 capture.release()
@@ -728,242 +1847,120 @@ def extract_video_frames(youtube_url):
     return frames
 
 
-# ============================================================
-# VIDEO FRAME ANALYSIS
-# ============================================================
-
-def extract_json_from_response(text):
-    """Extract a JSON object or array from model output."""
-
-    if not text:
-        return None
-
-    cleaned = text.strip()
-
-    cleaned = re.sub(
-        r"\A```(?:json)?\s*",
-        "",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-
-    cleaned = re.sub(
-        r"\s*```\Z",
-        "",
-        cleaned,
-    ).strip()
-
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    start_candidates = [
-        position
-        for position in (
-            cleaned.find("{"),
-            cleaned.find("["),
-        )
-        if position >= 0
-    ]
-
-    if not start_candidates:
-        return None
-
-    start = min(start_candidates)
-
-    for end in range(len(cleaned), start, -1):
-        candidate = cleaned[start:end].strip()
-
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-
-    return None
-
-
-def extract_note_headings(notes):
-    """Get the main topic headings from generated notes."""
-
-    headings = []
-
-    for line in notes.splitlines():
-        match = re.match(
-            r"^#{2,4}\s+(.+?)\s*$",
-            line.strip(),
-        )
-
-        if match:
-            heading = re.sub(
-                r"[*_`]",
-                "",
-                match.group(1),
-            ).strip()
-
-            if heading:
-                headings.append(heading)
-
-    return headings
-
-
-def analyze_video_frames(frames, notes):
+def analyze_video_frames_premium(frames, notes):
     """
-    Analyse frames using Gemini Vision.
+    Analyse original video frames with Gemini.
 
-    The model identifies which original video frames contain
-    useful educational visuals. It does not draw or generate
-    scientific diagrams.
+    This function is reserved for Premium Notes.
+    It is not called by generate_study_material().
     """
 
     if not frames:
         return []
 
-    if ChatGoogleGenerativeAI is None:
-        st.warning(
-            "Gemini Vision is unavailable. "
-            "The PDF will be generated without video diagrams."
-        )
-        return []
-
     if not os.getenv("GOOGLE_API_KEY"):
-        st.warning(
-            "GOOGLE_API_KEY is missing. "
-            "The PDF will be generated without video diagrams."
+        raise EnvironmentError(
+            "GOOGLE_API_KEY is required for Premium visual analysis."
         )
-        return []
+
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from langchain_core.messages import HumanMessage
+
+    except ImportError as exc:
+        raise ImportError(
+            "Install langchain-google-genai "
+            "to enable Premium visual analysis."
+        ) from exc
+
+    vision_llm = ChatGoogleGenerativeAI(
+        model=VISION_MODEL,
+        temperature=0.1,
+    )
 
     headings = extract_note_headings(notes)
 
-    headings_text = "\n".join(
-        f"- {heading}"
-        for heading in headings[:60]
-    )
+    prompt = f"""
+You are analysing original video frames for an educational PDF.
 
-    try:
-        vision_llm = ChatGoogleGenerativeAI(
-            model=VISION_MODEL,
-            temperature=0.1,
-        )
+Relevant study topics:
+{chr(10).join(headings[:50])}
 
-        content = [{
-            "type": "text",
-            "text": f"""
-You are analysing video frames for an educational study-notes PDF.
+Select only genuinely useful educational visuals.
 
-The notes cover these topics:
+Reject:
+- Talking-head shots.
+- Random backgrounds.
+- Unrelated images.
+- Unclear visuals.
+- Subtitle-only frames.
 
-{headings_text}
+Do not invent labels or structures.
+Analyse only what is actually visible.
 
-Your task is to identify frames that contain a genuinely useful
-educational visual related to these topics.
-
-A useful visual may be:
-- A labelled scientific diagram.
-- A biological structure or specimen illustration.
-- A molecular or chemical structure.
-- A technical architecture or component diagram.
-- A graph, chart, or meaningful educational illustration.
-- A process illustration that contains meaningful visual detail.
-
-Do NOT select:
-- A lecturer's face or talking-head shot.
-- A plain background.
-- A random video thumbnail.
-- A frame that only contains subtitles.
-- A frame unrelated to the study topics.
-- A frame where the visual is too small or unclear to be useful.
-
-IMPORTANT:
-- Analyse only what is actually visible.
-- Never invent labels or structures.
-- Do not infer hidden parts of a diagram.
-- Do not claim that unreadable text is readable.
-- A slide containing a real diagram may be selected.
-- A plain text slide should normally be rejected.
-- Prefer a clear visual over a decorative slide.
-
-Return valid JSON only, in this exact structure:
+Return valid JSON only:
 
 {{
   "frames": [
     {{
       "frame_number": 1,
       "is_useful": true,
-      "confidence": 0.90,
-      "visual_type": "scientific_diagram",
-      "related_heading": "Relevant heading from the notes",
-      "description": "Brief description of the visible visual",
-      "visible_labels": ["Label 1", "Label 2"],
-      "reason": "Why this frame is useful"
+      "confidence": 0.9,
+      "related_heading": "Topic heading",
+      "description": "Description of the visible visual",
+      "visible_labels": []
     }}
   ]
 }}
 
-Use the actual frame_number given before each image.
-confidence must be between 0 and 1.
-If no frame is useful, return:
+If nothing is useful, return:
 {{"frames": []}}
-""",
-        }]
+"""
 
-        for index, frame in enumerate(frames, start=1):
+    content = [{
+        "type": "text",
+        "text": prompt,
+    }]
 
-            encoded = base64.b64encode(
-                frame["image"]
-            ).decode("utf-8")
+    import base64
 
-            content.append({
-                "type": "text",
-                "text": (
-                    f"FRAME_NUMBER: {index}\n"
-                    f"TIMESTAMP_SECONDS: {frame['timestamp']:.2f}"
-                ),
-            })
+    for index, frame in enumerate(frames, start=1):
 
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": (
-                        f"data:image/jpeg;base64,{encoded}"
-                    )
-                },
-            })
+        encoded = base64.b64encode(
+            frame["image"]
+        ).decode("utf-8")
 
-        from langchain_core.messages import HumanMessage
+        content.append({
+            "type": "text",
+            "text": (
+                f"FRAME_NUMBER: {index}\n"
+                f"TIMESTAMP_SECONDS: {frame['timestamp']:.2f}"
+            ),
+        })
 
-        response = vision_llm.invoke([
-            HumanMessage(content=content)
-        ])
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{encoded}"
+            },
+        })
 
-        result = extract_json_from_response(
-            response_to_text(response)
-        )
+    response = vision_llm.invoke([
+        HumanMessage(content=content)
+    ])
 
-        if not isinstance(result, dict):
-            return []
+    result = extract_json_from_response(
+        response_to_text(response)
+    )
 
-        analysed_frames = result.get("frames", [])
+    if isinstance(result, dict):
+        return result.get("frames", [])
 
-        if not isinstance(analysed_frames, list):
-            return []
+    return []
 
-        return analysed_frames
-
-    except Exception as exc:
-        st.warning(
-            "Gemini visual analysis could not be completed. "
-            f"Notes will be generated without video diagrams. Details: {exc}"
-        )
-        return []
-
-
-# ============================================================
-# SELECT RELEVANT VIDEO VISUALS
-# ============================================================
 
 def timestamp_to_text(seconds):
-    """Convert seconds into HH:MM:SS format."""
+    """Convert seconds into HH:MM:SS."""
 
     seconds = max(0, int(seconds))
 
@@ -978,39 +1975,17 @@ def timestamp_to_text(seconds):
     )
 
 
-def convert_frame_to_png(image_bytes):
-    """Convert the original extracted frame into PNG bytes."""
-
-    with Image.open(BytesIO(image_bytes)) as image:
-        image = image.convert("RGB")
-
-        output = BytesIO()
-
-        image.save(
-            output,
-            format="PNG",
-            optimize=True,
-        )
-
-        return output.getvalue()
-
-
-def select_relevant_video_visuals(
+def select_relevant_video_visuals_premium(
     frames,
     analysis,
 ):
-    """
-    Select only frames identified as useful by Gemini.
-
-    Original video frames are retained. No synthetic
-    scientific structures or generic flowcharts are drawn.
-    """
+    """Select useful original frames for future Premium Notes."""
 
     if not frames or not analysis:
         return []
 
     selected = []
-    used_frame_numbers = set()
+    used_numbers = set()
 
     for item in analysis:
 
@@ -1024,93 +1999,69 @@ def select_relevant_video_visuals(
             confidence = float(
                 item.get("confidence", 0)
             )
-        except (TypeError, ValueError):
-            confidence = 0
-
-        if confidence < MIN_VISUAL_CONFIDENCE:
-            continue
-
-        try:
             frame_number = int(
                 item.get("frame_number", 0)
             )
         except (TypeError, ValueError):
             continue
 
+        if confidence < 0.65:
+            continue
+
         if (
             frame_number < 1
             or frame_number > len(frames)
-            or frame_number in used_frame_numbers
+            or frame_number in used_numbers
         ):
-            continue
-
-        visual_type = str(
-            item.get("visual_type", "")
-        ).strip().lower()
-
-        rejected_types = {
-            "talking_head",
-            "person",
-            "subtitle",
-            "text_only",
-            "irrelevant",
-            "unclear",
-        }
-
-        if visual_type in rejected_types:
             continue
 
         frame = frames[frame_number - 1]
 
         try:
-            png_bytes = convert_frame_to_png(
-                frame["image"]
-            )
+            with Image.open(
+                BytesIO(frame["image"])
+            ) as image:
+
+                output = BytesIO()
+
+                image.convert("RGB").save(
+                    output,
+                    format="PNG",
+                    optimize=True,
+                )
+
+                png_bytes = output.getvalue()
+
         except Exception:
             continue
 
         title = str(
             item.get(
                 "related_heading",
-                "Video visual",
+                "Video Visual",
             )
         ).strip()
 
-        description = str(
-            item.get("description", "")
-        ).strip()
-
-        visible_labels = item.get(
-            "visible_labels",
-            [],
-        )
-
-        if not isinstance(visible_labels, list):
-            visible_labels = []
-
-        visible_labels = [
-            str(label).strip()
-            for label in visible_labels
-            if str(label).strip()
-        ][:12]
-
         selected.append({
             "number": len(selected) + 1,
-            "title": title[:150],
-            "related_heading": title[:150],
-            "image": png_bytes,
+            "title": title,
+            "related_heading": title,
+            "description": str(
+                item.get("description", "")
+            ),
             "timestamp": frame["timestamp"],
             "timestamp_label": timestamp_to_text(
                 frame["timestamp"]
             ),
-            "description": description[:500],
-            "visible_labels": visible_labels,
-            "visual_type": visual_type,
-            "confidence": confidence,
+            "image": png_bytes,
+            "visible_labels": item.get(
+                "visible_labels",
+                [],
+            ),
             "source": "Original YouTube video frame",
         })
 
-        used_frame_numbers.add(frame_number)
+        used_numbers.add(frame_number)
 
         if len(selected) >= MAX_DIAGRAMS:
             break
@@ -1123,6 +2074,7 @@ def select_relevant_video_visuals(
 # ============================================================
 
 def extract_notes_title(notes):
+
     if not isinstance(notes, str):
         return "Video Study Notes"
 
@@ -1136,6 +2088,7 @@ def extract_notes_title(notes):
         )
 
         if match:
+
             title = re.sub(
                 r"[*_`]",
                 "",
@@ -1149,6 +2102,7 @@ def extract_notes_title(notes):
 
 
 def create_pdf_filename(title):
+
     title = re.sub(
         r"[^\w\s-]",
         "",
@@ -1167,44 +2121,6 @@ def create_pdf_filename(title):
 
 
 # ============================================================
-# COMPATIBILITY FUNCTIONS
-# ============================================================
-
-def parse_diagram_material(raw_output):
-    """
-    Kept for compatibility with older code.
-
-    Synthetic diagram specifications are intentionally no
-    longer used in the video-visual workflow.
-    """
-    return []
-
-
-def generate_diagram_specifications(
-    llm,
-    notes,
-    language,
-    visual_context="",
-):
-    """
-    Compatibility function.
-
-    The updated workflow uses original video frames instead
-    of generated generic flowcharts.
-    """
-    return []
-
-
-def render_diagrams(diagrams):
-    """
-    Compatibility function.
-
-    The updated workflow does not draw synthetic diagrams.
-    """
-    return diagrams if isinstance(diagrams, list) else []
-
-
-# ============================================================
 # GENERATE COMPLETE STUDY MATERIAL
 # ============================================================
 
@@ -1214,25 +2130,24 @@ def generate_study_material(
     language="English",
 ):
     """
-    Generate complete notes and a notebook-style PDF.
+    Generate Standard Notes and a notebook-style PDF.
 
-    Workflow:
+    STANDARD WORKFLOW:
     1. Load transcript.
-    2. Summarize the transcript.
+    2. Summarize transcript.
     3. Generate detailed study notes.
-    4. Extract original video frames.
-    5. Analyse frames using Gemini Vision.
-    6. Select relevant educational visuals.
-    7. Generate the PDF.
+    4. Generate diagram specifications using Groq.
+    5. Render diagrams using Pillow.
+    6. Generate the PDF.
+
+    Gemini Vision and original video frame extraction
+    are intentionally excluded from this workflow.
+
+    Returns:
+        notes, rendered_diagrams, pdf_bytes
     """
 
-    supported_languages = {
-        "English",
-        "Hindi",
-        "Hinglish",
-    }
-
-    if language not in supported_languages:
+    if language not in SUPPORTED_LANGUAGES:
         raise ValueError(
             f"Unsupported language: {language}"
         )
@@ -1246,7 +2161,7 @@ def generate_study_material(
     ):
         documents = load_transcript(youtube_url)
 
-    # STEP 2: Initialize language model.
+    # STEP 2: Initialize Groq.
     llm = get_llm()
 
     # STEP 3: Summarize transcript.
@@ -1268,34 +2183,25 @@ def generate_study_material(
             "The generated study notes are empty."
         )
 
-    # STEP 5: Extract original video frames.
+    # STEP 5: Generate diagram specifications.
     with st.spinner(
-        "Extracting visual references from the video..."
+        "Designing topic-specific educational diagrams..."
     ):
-        frames = extract_video_frames(youtube_url)
-
-    # STEP 6: Analyse the extracted frames.
-    visual_analysis = []
-
-    if frames:
-        with st.spinner(
-            f"Analysing {len(frames)} video frames..."
-        ):
-            visual_analysis = analyze_video_frames(
-                frames=frames,
-                notes=notes,
-            )
-
-    # STEP 7: Select relevant visuals.
-    with st.spinner(
-        "Selecting relevant educational visuals..."
-    ):
-        selected_visuals = select_relevant_video_visuals(
-            frames=frames,
-            analysis=visual_analysis,
+        diagram_specs = generate_diagram_specifications(
+            llm=llm,
+            notes=notes,
+            language=language,
         )
 
-    # STEP 8: Generate PDF.
+    # STEP 6: Render diagrams with Pillow.
+    with st.spinner(
+        "Drawing diagrams using Pillow..."
+    ):
+        rendered_diagrams = render_diagrams(
+            diagram_specs
+        )
+
+    # STEP 7: Generate PDF.
     notes_title = extract_notes_title(notes)
 
     with st.spinner(
@@ -1305,7 +2211,7 @@ def generate_study_material(
             notes=notes,
             title=notes_title,
             language=language,
-            diagram_images=selected_visuals,
+            diagram_images=rendered_diagrams,
         )
 
     if (
@@ -1318,7 +2224,7 @@ def generate_study_material(
 
     return (
         notes,
-        selected_visuals,
+        rendered_diagrams,
         pdf_bytes,
     )
 
@@ -1362,6 +2268,7 @@ def main():
     }
 
     for key, value in defaults.items():
+
         if key not in st.session_state:
             st.session_state[key] = value
 
@@ -1369,7 +2276,7 @@ def main():
 
     st.write(
         "Ask questions about a YouTube video and generate "
-        "complete study notes with relevant video visuals."
+        "complete study notes with topic-specific diagrams."
     )
 
     youtube_url = st.text_input(
@@ -1391,6 +2298,7 @@ def main():
         st.session_state.loaded_url is not None
         and st.session_state.loaded_url != youtube_url
     ):
+
         st.session_state.rag_chain = None
         st.session_state.loaded_url = None
         st.session_state.chat_history = []
@@ -1403,6 +2311,7 @@ def main():
         "Load video for questions",
         type="secondary",
     ):
+
         try:
             with st.spinner(
                 "Building the transcript search index..."
@@ -1423,7 +2332,10 @@ def main():
                 f"Could not load the video: {exc}"
             )
 
-    # Chat interface.
+    # --------------------------------------------------------
+    # CHAT INTERFACE
+    # --------------------------------------------------------
+
     if (
         st.session_state.rag_chain is not None
         and st.session_state.loaded_url == youtube_url
@@ -1432,6 +2344,7 @@ def main():
         st.subheader("Ask questions")
 
         for message in st.session_state.chat_history:
+
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
@@ -1450,6 +2363,7 @@ def main():
                     with st.spinner(
                         "Searching the transcript..."
                     ):
+
                         answer = st.session_state.rag_chain.invoke(
                             question
                         )
@@ -1472,14 +2386,17 @@ def main():
                     f"Could not answer the question: {exc}"
                 )
 
-    # Study material generation.
+    # --------------------------------------------------------
+    # STUDY MATERIAL GENERATION
+    # --------------------------------------------------------
+
     st.divider()
 
     st.subheader("Generate complete study material")
 
     st.write(
-        "Create detailed notes and include useful educational "
-        "visuals taken from the actual video."
+        "Create detailed notes with highlighted formulas, "
+        "chemical reactions and Pillow-generated diagrams."
     )
 
     if st.button(
@@ -1488,6 +2405,7 @@ def main():
     ):
 
         try:
+
             notes, diagrams, pdf_bytes = generate_study_material(
                 youtube_url=youtube_url,
                 chat_history=st.session_state.chat_history,
@@ -1506,7 +2424,7 @@ def main():
 
             st.success(
                 "Study material generated successfully. "
-                f"{len(diagrams)} relevant video visual(s) included."
+                f"{len(diagrams)} diagram(s) included."
             )
 
         except Exception as exc:
@@ -1514,10 +2432,14 @@ def main():
                 f"Study material generation failed: {exc}"
             )
 
-    # Notes preview.
+    # --------------------------------------------------------
+    # NOTES PREVIEW
+    # --------------------------------------------------------
+
     if st.session_state.generated_notes:
 
         st.divider()
+
         st.subheader("Study notes preview")
 
         st.markdown(
@@ -1526,19 +2448,13 @@ def main():
 
         if st.session_state.generated_diagrams:
 
-            st.subheader("Relevant video visuals")
+            st.subheader("Generated educational diagrams")
 
             for diagram in st.session_state.generated_diagrams:
 
                 st.markdown(
                     f"**{diagram['title']}**"
                 )
-
-                if diagram.get("timestamp_label"):
-                    st.caption(
-                        "Video timestamp: "
-                        f"{diagram['timestamp_label']}"
-                    )
 
                 if diagram.get("description"):
                     st.caption(
@@ -1552,12 +2468,14 @@ def main():
 
         else:
             st.info(
-                "No sufficiently clear and relevant educational "
-                "visuals were found in the sampled video frames. "
-                "The notes PDF was generated without unrelated diagrams."
+                "No additional diagrams were needed "
+                "for the generated notes."
             )
 
-    # PDF download.
+    # --------------------------------------------------------
+    # PDF DOWNLOAD
+    # --------------------------------------------------------
+
     if st.session_state.generated_pdf:
 
         st.download_button(
