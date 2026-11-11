@@ -127,7 +127,10 @@ SQLite is used to store conversation and message information locally.
 
 The application follows a Retrieval-Augmented Generation architecture combined with AI-powered content generation and assessment modules.
 
-```flowchart TD
+## System Architecture
+
+```mermaid
+flowchart TD
     A(["YouTube Video URL"]) --> B["RAG Pipeline"]
 
     B --> C["Transcript Extraction"]
@@ -148,6 +151,8 @@ The application follows a Retrieval-Augmented Generation architecture combined w
     L --> O["Download Presentation"]
 
     H <--> P[("SQLite Chat History")]
+```
+
 
 ## 🛠️ Technology Stack
 
