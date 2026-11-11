@@ -22,6 +22,7 @@ from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 from langchain_core.prompts import PromptTemplate
 
 from pdf_generator import create_study_notes_pdf
+from quiz_generation import generate_quiz
 
 
 # ============================================================
@@ -157,6 +158,31 @@ def format_docs(documents):
         document.page_content
         for document in documents
     )
+
+def normalize_youtube_url(youtube_url):
+    """
+    Normalize common YouTube URL formats so the same video
+    can be identified consistently across quiz generations.
+    """
+
+    if not youtube_url:
+        return ""
+
+    url = youtube_url.strip()
+
+    patterns = [
+        r"(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})",
+        r"youtube\.com/embed/([a-zA-Z0-9_-]{11})",
+        r"youtube\.com/shorts/([a-zA-Z0-9_-]{11})",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, url)
+
+        if match:
+            return f"https://www.youtube.com/watch?v={match.group(1)}"
+
+    return url
 
 
 # ============================================================
@@ -2228,7 +2254,126 @@ def generate_study_material(
         pdf_bytes,
     )
 
+# ============================================================
+# QUIZ GENERATION INTEGRATION
+# ============================================================
 
+
+def generate_video_quiz(
+    youtube_url,
+    notes="",
+    chat_history=None,
+    language="English",
+    question_count=10,
+    difficulty="Mixed",
+    question_types=None,
+    previous_questions=None,
+):
+    """
+    Generate a quiz using:
+    - Complete YouTube transcript
+    - Generated study notes
+    - Learner chat history
+    - Previously generated questions
+
+    Previous questions are supplied to quiz_generation.py
+    to reduce repetition across quiz attempts.
+    """
+
+    if not youtube_url or not youtube_url.strip():
+        raise ValueError("Please provide a valid YouTube URL.")
+
+    if language not in SUPPORTED_LANGUAGES:
+        raise ValueError(
+            f"Unsupported quiz language: {language}"
+        )
+
+    try:
+        question_count = int(question_count)
+    except (TypeError, ValueError):
+        raise ValueError("Question count must be a valid integer.")
+
+    if not 1 <= question_count <= 30:
+        raise ValueError(
+            "Question count must be between 1 and 30."
+        )
+
+    difficulty = str(difficulty or "Mixed").strip()
+
+    if difficulty not in {"Easy", "Medium", "Hard", "Mixed"}:
+        raise ValueError("Invalid quiz difficulty.")
+
+    # Normalize previous question history.
+    cleaned_previous_questions = []
+
+    if isinstance(previous_questions, (list, tuple)):
+        for item in previous_questions:
+
+            if isinstance(item, dict):
+                question_text = str(
+                    item.get("question", "")
+                ).strip()
+
+            else:
+                question_text = str(item).strip()
+
+            if question_text:
+                cleaned_previous_questions.append(
+                    question_text[:1000]
+                )
+
+    # Avoid passing an unnecessarily large history to the LLM.
+    cleaned_previous_questions = (
+        cleaned_previous_questions[-150:]
+    )
+
+    # Load the complete transcript.
+    documents = load_transcript(
+        youtube_url.strip()
+    )
+
+    transcript = format_docs(documents)
+
+    if not transcript.strip():
+        raise ValueError(
+            "The YouTube transcript is empty."
+        )
+
+    llm = get_llm()
+
+    quiz = generate_quiz(
+        llm=llm,
+        transcript=transcript,
+        notes=notes or "",
+        chat_history=chat_history or [],
+        language=language,
+        question_count=question_count,
+        difficulty=difficulty,
+        question_types=question_types,
+        previous_questions=cleaned_previous_questions,
+    )
+
+    if not isinstance(quiz, dict):
+        raise ValueError(
+            "Quiz generation returned an invalid response."
+        )
+
+    if not isinstance(quiz.get("questions"), list):
+        raise ValueError(
+            "Quiz generation did not return a valid question list."
+        )
+
+    if len(quiz["questions"]) != question_count:
+        raise ValueError(
+            f"Expected {question_count} questions, "
+            f"but received {len(quiz['questions'])}."
+        )
+
+    quiz["source_url"] = normalize_youtube_url(
+        youtube_url
+    )
+
+    return quiz
 # ============================================================
 # COMPATIBILITY ALIAS
 # ============================================================
