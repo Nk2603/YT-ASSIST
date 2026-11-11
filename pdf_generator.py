@@ -30,8 +30,6 @@ HANDWRITING_FONT_STACK = (
     '"NotoSans", "NotoDevanagari", sans-serif'
 )
 
-# MathJax provides proper mathematical typesetting.
-# mhchem adds chemical equation notation such as \ce{H2O}.
 MATHJAX_URL = (
     "https://cdn.jsdelivr.net/npm/mathjax@3/"
     "es5/tex-chtml.js"
@@ -44,6 +42,7 @@ ALLOWED_TAGS = set(bleach.sanitizer.ALLOWED_TAGS) | {
     "pre", "code", "hr", "blockquote", "br",
     "div", "span", "strong", "em",
     "sup", "sub",
+    "figure", "figcaption", "img",
 }
 
 ALLOWED_ATTRIBUTES = {
@@ -54,6 +53,9 @@ ALLOWED_ATTRIBUTES = {
     "pre": ["class"],
     "div": ["class"],
     "span": ["class"],
+    "figure": ["class"],
+    "figcaption": ["class"],
+    "img": ["src", "alt", "class"],
 }
 
 
@@ -67,8 +69,7 @@ def font_as_data_uri(font_path):
     if not font_path.is_file():
         raise FileNotFoundError(
             f"Font not found: {font_path}\n"
-            "Check that the required Noto font files exist "
-            "inside the project's fonts/ directory."
+            "Check the required Noto font files inside fonts/."
         )
 
     encoded = base64.b64encode(
@@ -86,18 +87,12 @@ def image_as_data_uri(image_bytes):
     """Convert valid PNG bytes into an embeddable HTML image."""
 
     if not isinstance(image_bytes, bytes) or not image_bytes:
-        raise ValueError(
-            "A diagram image is empty or invalid."
-        )
+        raise ValueError("A diagram image is empty or invalid.")
 
     if not image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise ValueError(
-            "The supplied visual must be a valid PNG image."
-        )
+        raise ValueError("The supplied visual must be a valid PNG.")
 
-    encoded = base64.b64encode(
-        image_bytes
-    ).decode("ascii")
+    encoded = base64.b64encode(image_bytes).decode("ascii")
 
     return f"data:image/png;base64,{encoded}"
 
@@ -114,23 +109,9 @@ def normalize_text(value):
         str(value or ""),
     )
 
-    value = re.sub(
-        r"<[^>]+>",
-        " ",
-        value,
-    )
-
-    value = re.sub(
-        r"[*_`#]",
-        "",
-        value,
-    )
-
-    value = re.sub(
-        r"\s+",
-        " ",
-        value,
-    )
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = re.sub(r"[*_`#]", "", value)
+    value = re.sub(r"\s+", " ", value)
 
     return value.strip().lower()
 
@@ -173,8 +154,8 @@ def protect_math_delimiters(text):
     """
     Protect LaTeX delimiters before Markdown conversion.
 
-    Python-Markdown may interpret backslashes before square
-    brackets as Markdown escapes. Placeholders preserve them.
+    This prevents Markdown from interpreting LaTeX delimiters
+    as ordinary formatting.
     """
 
     replacements = {
@@ -210,38 +191,55 @@ def restore_math_delimiters(rendered_html):
 
 
 # ============================================================
-# FORMULA AND CHEMICAL REACTION BOXES
+# SPECIAL EDUCATIONAL BLOCKS
 # ============================================================
 
 def convert_special_blockquotes(rendered_html):
-    """
-    Convert special Markdown blockquotes into highlighted boxes.
+    """Convert labelled Markdown blockquotes into styled boxes."""
 
-    Supported:
-
-        > [FORMULA]
-        > \\[
-        > F = ma
-        > \\]
-
-        > [REACTION]
-        > \\(2H_2 + O_2 -> 2H_2O\\)
-
-    The marker is removed and the remaining mathematical
-    expression is preserved for MathJax.
-    """
-
-    pattern = re.compile(
+    block_pattern = re.compile(
         r"<blockquote\b[^>]*>(.*?)</blockquote>",
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    def replace_block(match):
+    block_types = {
+        "FORMULA": (
+            "formula-box",
+            "IMPORTANT MATHEMATICAL FORMULA",
+        ),
+        "REACTION": (
+            "reaction-box",
+            "CHEMICAL REACTION",
+        ),
+        "ADDITIONAL KNOWLEDGE": (
+            "additional-knowledge-box",
+            "ADDITIONAL KNOWLEDGE",
+        ),
+        "NEW ILLUSTRATIVE EXAMPLE": (
+            "new-example-box",
+            "NEW ILLUSTRATIVE EXAMPLE",
+        ),
+        "VIDEO EXAMPLE": (
+            "video-example-box",
+            "EXAMPLE FROM THE VIDEO",
+        ),
+        "WORKED EXAMPLE": (
+            "worked-example-box",
+            "WORKED EXAMPLE",
+        ),
+        "STEP-BY-STEP EXAMPLE": (
+            "worked-example-box",
+            "STEP-BY-STEP EXAMPLE",
+        ),
+    }
 
+    def replace_block(match):
         inner_html = match.group(1)
 
         marker = re.search(
-            r"\[\s*(FORMULA|REACTION)\s*\]",
+            r"\[\s*(FORMULA|REACTION|ADDITIONAL\s+KNOWLEDGE|"
+            r"NEW\s+ILLUSTRATIVE\s+EXAMPLE|VIDEO\s+EXAMPLE|"
+            r"WORKED\s+EXAMPLE|STEP-BY-STEP\s+EXAMPLE)\s*\]",
             inner_html,
             flags=re.IGNORECASE,
         )
@@ -249,9 +247,14 @@ def convert_special_blockquotes(rendered_html):
         if not marker:
             return match.group(0)
 
-        box_type = marker.group(1).upper()
+        marker_name = re.sub(
+            r"\s+",
+            " ",
+            marker.group(1).upper(),
+        )
 
-        # Remove the marker and one optional following line break.
+        css_class, label = block_types[marker_name]
+
         content = (
             inner_html[:marker.start()]
             + inner_html[marker.end():]
@@ -282,29 +285,77 @@ def convert_special_blockquotes(rendered_html):
 
         content = content.strip()
 
-        if box_type == "FORMULA":
-
-            label = "IMPORTANT MATHEMATICAL FORMULA"
-            css_class = "formula-box"
-
-        else:
-
-            label = "CHEMICAL REACTION"
-            css_class = "reaction-box"
-
         return f"""
             <div class="{css_class}">
-                <div class="special-box-label">
-                    {label}
-                </div>
-                <div class="special-box-content">
-                    {content}
-                </div>
+                <div class="special-box-label">{label}</div>
+                <div class="special-box-content">{content}</div>
             </div>
         """
 
-    return pattern.sub(
-        replace_block,
+    return block_pattern.sub(replace_block, rendered_html)
+
+
+# ============================================================
+# AUTOMATIC SECTION CLASSIFICATION
+# ============================================================
+
+def classify_educational_headings(rendered_html):
+    """Apply styling classes to educational headings."""
+
+    heading_pattern = re.compile(
+        r"<h([1-4])\b([^>]*)>(.*?)</h\1>",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def replace_heading(match):
+        level = match.group(1)
+        attributes = match.group(2) or ""
+        content = match.group(3)
+
+        plain_text = html.unescape(
+            re.sub(r"<[^>]+>", " ", content)
+        )
+
+        normalized = normalize_text(plain_text)
+
+        heading_class = None
+
+        if "additional knowledge" in normalized:
+            heading_class = "additional-knowledge-heading"
+
+        elif (
+            "new illustrative example" in normalized
+            or "new example" in normalized
+        ):
+            heading_class = "new-example-heading"
+
+        elif "video example" in normalized:
+            heading_class = "video-example-heading"
+
+        elif (
+            "worked example" in normalized
+            or "step by step example" in normalized
+            or "numerical example" in normalized
+        ):
+            heading_class = "worked-example-heading"
+
+        if not heading_class:
+            return match.group(0)
+
+        attributes = re.sub(
+            r'\sclass="[^"]*"',
+            "",
+            attributes,
+            flags=re.IGNORECASE,
+        )
+
+        return (
+            f'<h{level}{attributes} class="{heading_class}">'
+            f"{content}</h{level}>"
+        )
+
+    return heading_pattern.sub(
+        replace_heading,
         rendered_html,
     )
 
@@ -328,15 +379,14 @@ def markdown_to_safe_html(text):
     )
 
     rendered = restore_math_delimiters(rendered)
-
-    rendered = convert_special_blockquotes(
-        rendered
-    )
+    rendered = convert_special_blockquotes(rendered)
+    rendered = classify_educational_headings(rendered)
 
     return bleach.clean(
         rendered,
         tags=ALLOWED_TAGS,
         attributes=ALLOWED_ATTRIBUTES,
+        protocols={"http", "https", "data"},
         strip=True,
     )
 
@@ -356,38 +406,20 @@ def get_diagram_keywords(diagram):
         str(diagram.get("diagram_type", "")),
     ]
 
-    visible_labels = diagram.get(
-        "visible_labels",
-        [],
-    )
+    visible_labels = diagram.get("visible_labels", [])
 
     if isinstance(visible_labels, list):
-        values.extend(
-            str(label)
-            for label in visible_labels
-        )
+        values.extend(str(label) for label in visible_labels)
 
     for node in diagram.get("nodes", []):
-
         if isinstance(node, dict):
-
-            values.append(
-                str(node.get("label", ""))
-            )
-
-            values.append(
-                str(node.get("details", ""))
-            )
-
+            values.append(str(node.get("label", "")))
+            values.append(str(node.get("details", "")))
         else:
             values.append(str(node))
 
     combined = " ".join(values).lower()
-
-    words = re.findall(
-        r"[a-zA-Z0-9]+",
-        combined,
-    )
+    words = re.findall(r"[a-zA-Z0-9]+", combined)
 
     ignored = {
         "the", "and", "for", "with", "from",
@@ -413,12 +445,8 @@ def find_matching_heading(diagram, headings):
     )
 
     if related_heading:
-
         for index, heading in enumerate(headings):
-
-            heading_text = normalize_text(
-                heading.group(2)
-            )
+            heading_text = normalize_text(heading.group(2))
 
             if (
                 heading_text == related_heading
@@ -433,21 +461,13 @@ def find_matching_heading(diagram, headings):
     best_score = 0
 
     for heading_index, heading in enumerate(headings):
-
-        heading_text = normalize_text(
-            heading.group(2)
-        )
+        heading_text = normalize_text(heading.group(2))
 
         heading_words = set(
-            re.findall(
-                r"[a-zA-Z0-9]+",
-                heading_text,
-            )
+            re.findall(r"[a-zA-Z0-9]+", heading_text)
         )
 
-        score = len(
-            keywords.intersection(heading_words)
-        )
+        score = len(keywords.intersection(heading_words))
 
         if score > best_score:
             best_score = score
@@ -467,12 +487,7 @@ def create_diagram_section(diagram, index):
     """Create a diagram section with a caption."""
 
     title = html.escape(
-        str(
-            diagram.get(
-                "title",
-                f"Concept Diagram {index}",
-            )
-        )
+        str(diagram.get("title", f"Concept Diagram {index}"))
     )
 
     description = html.escape(
@@ -483,7 +498,7 @@ def create_diagram_section(diagram, index):
         str(
             diagram.get(
                 "source",
-                "Pillow-generated educational diagram",
+                "Generated educational diagram",
             )
         )
     )
@@ -494,28 +509,12 @@ def create_diagram_section(diagram, index):
 
     return f"""
         <figure class="diagram">
-
-            <img
-                src="{image_uri}"
-                alt="{title}"
-            >
-
+            <img src="{image_uri}" alt="{title}">
             <figcaption>
-
-                <div class="visual-title">
-                    {title}
-                </div>
-
-                <p class="visual-description">
-                    {description}
-                </p>
-
-                <p class="visual-source">
-                    {source}
-                </p>
-
+                <div class="visual-title">{title}</div>
+                <p class="visual-description">{description}</p>
+                <p class="visual-source">{source}</p>
             </figcaption>
-
         </figure>
     """
 
@@ -524,16 +523,8 @@ def create_diagram_section(diagram, index):
 # INSERT DIAGRAMS NEAR MATCHING TOPICS
 # ============================================================
 
-def insert_diagrams_near_headings(
-    notes_html,
-    diagrams,
-):
-    """
-    Insert diagrams near matching topic headings.
-
-    Exact heading matching is preferred.
-    Unmatched diagrams go into an appendix.
-    """
+def insert_diagrams_near_headings(notes_html, diagrams):
+    """Insert diagrams near matching topic headings."""
 
     if not diagrams:
         return notes_html, []
@@ -554,18 +545,14 @@ def insert_diagrams_near_headings(
     appendix = []
 
     for diagram_index, diagram in enumerate(diagrams):
-
         heading_index = find_matching_heading(
             diagram,
             initial_headings,
         )
 
         if heading_index is None:
-
             appendix.append(diagram_index)
-
         else:
-
             placements.setdefault(
                 heading_index,
                 [],
@@ -573,32 +560,22 @@ def insert_diagrams_near_headings(
 
     result = notes_html
 
-    # Process from bottom to top to preserve earlier offsets.
-    for heading_index in sorted(
-        placements.keys(),
-        reverse=True,
-    ):
-
+    for heading_index in sorted(placements.keys(), reverse=True):
         current_headings = list(
             heading_pattern.finditer(result)
         )
 
         if heading_index >= len(current_headings):
-            appendix.extend(
-                placements[heading_index]
-            )
+            appendix.extend(placements[heading_index])
             continue
 
         heading = current_headings[heading_index]
 
         if heading_index + 1 < len(current_headings):
-
             next_heading_start = current_headings[
                 heading_index + 1
             ].start()
-
         else:
-
             next_heading_start = len(result)
 
         section_text = result[
@@ -612,14 +589,10 @@ def insert_diagrams_near_headings(
         )
 
         if first_paragraph:
-
             insertion_point = (
-                heading.end()
-                + first_paragraph.end()
+                heading.end() + first_paragraph.end()
             )
-
         else:
-
             insertion_point = heading.end()
 
         diagram_html = "\n".join(
@@ -645,11 +618,8 @@ def insert_diagrams_near_headings(
 # DIAGRAM APPENDIX
 # ============================================================
 
-def create_visual_appendix(
-    diagrams,
-    appendix_indices,
-):
-    """Create an appendix for diagrams without matching headings."""
+def create_visual_appendix(diagrams, appendix_indices):
+    """Create an appendix for unmatched diagrams."""
 
     if not appendix_indices:
         return ""
@@ -657,7 +627,6 @@ def create_visual_appendix(
     sections = []
 
     for index in appendix_indices:
-
         sections.append(
             create_diagram_section(
                 diagrams[index],
@@ -667,7 +636,6 @@ def create_visual_appendix(
 
     return f"""
         <section class="diagram-appendix">
-
             <h2>Additional Concept Diagrams</h2>
 
             <p class="appendix-intro">
@@ -676,7 +644,6 @@ def create_visual_appendix(
             </p>
 
             {"".join(sections)}
-
         </section>
     """
 
@@ -717,11 +684,9 @@ def create_document_html(
         title,
     )
 
-    notes_html, appendix_indices = (
-        insert_diagrams_near_headings(
-            notes_html,
-            diagram_images,
-        )
+    notes_html, appendix_indices = insert_diagrams_near_headings(
+        notes_html,
+        diagram_images,
     )
 
     appendix_html = create_visual_appendix(
@@ -731,11 +696,8 @@ def create_document_html(
 
     document_html = f"""
     <!DOCTYPE html>
-
     <html lang="{document_language}">
-
     <head>
-
         <meta charset="UTF-8">
 
         <meta
@@ -743,20 +705,29 @@ def create_document_html(
             content="width=device-width, initial-scale=1.0"
         >
 
-        <!-- MathJax configuration -->
         <script>
             window.MathJax = {{
+                loader: {{
+                    load: ['[tex]/mhchem']
+                }},
+
                 tex: {{
                     packages: {{
                         '[+]': ['mhchem']
                     }},
+
                     inlineMath: [
-                        ['\\\\(', '\\\\)']
+                        ['\\\\(', '\\\\)'],
+                        ['$', '$']
                     ],
+
                     displayMath: [
-                        ['\\\\[', '\\\\]']
+                        ['\\\\[', '\\\\]'],
+                        ['$$', '$$']
                     ],
+
                     processEscapes: true,
+                    processEnvironments: true,
                     tags: 'ams'
                 }},
 
@@ -786,16 +757,11 @@ def create_document_html(
 
         <style>
 
-            /* ==========================================
-               EMBEDDED FONTS
-            ========================================== */
-
             @font-face {{
                 font-family: "NotoSans";
                 src: url("{fonts['latin_regular']}")
                     format("truetype");
                 font-weight: 400;
-                font-style: normal;
             }}
 
             @font-face {{
@@ -803,7 +769,6 @@ def create_document_html(
                 src: url("{fonts['latin_bold']}")
                     format("truetype");
                 font-weight: 700;
-                font-style: normal;
             }}
 
             @font-face {{
@@ -811,7 +776,6 @@ def create_document_html(
                 src: url("{fonts['devanagari_regular']}")
                     format("truetype");
                 font-weight: 400;
-                font-style: normal;
             }}
 
             @font-face {{
@@ -819,13 +783,7 @@ def create_document_html(
                 src: url("{fonts['devanagari_bold']}")
                     format("truetype");
                 font-weight: 700;
-                font-style: normal;
             }}
-
-
-            /* ==========================================
-               PAGE SETTINGS
-            ========================================== */
 
             @page {{
                 size: A4;
@@ -852,10 +810,7 @@ def create_document_html(
                 print-color-adjust: exact;
             }}
 
-
-            /* ==========================================
-               NOTEBOOK PAPER
-            ========================================== */
+            /* NOTEBOOK PAPER */
 
             .paper {{
                 position: relative;
@@ -888,10 +843,7 @@ def create_document_html(
                 print-color-adjust: exact;
             }}
 
-
-            /* ==========================================
-               COVER
-            ========================================== */
+            /* COVER */
 
             .cover {{
                 text-align: center;
@@ -917,10 +869,7 @@ def create_document_html(
                 margin: 3px 0;
             }}
 
-
-            /* ==========================================
-               NOTES CONTENT
-            ========================================== */
+            /* NOTES */
 
             main {{
                 background: rgba(255, 255, 255, 0.88);
@@ -1011,10 +960,37 @@ def create_document_html(
                 margin: 13px 0;
             }}
 
+            /* SECTION HEADING VARIANTS */
 
-            /* ==========================================
-               TABLES
-            ========================================== */
+            .additional-knowledge-heading {{
+                color: #176B68;
+                background: #E2F5F1;
+                border-left: 5px solid #23978B;
+                border-bottom: 1px solid #B7E3DB;
+            }}
+
+            .new-example-heading {{
+                color: #8B541A;
+                background: #FFF1D9;
+                border-left: 5px solid #E5A13C;
+                border-bottom: 1px solid #F1D6A6;
+            }}
+
+            .video-example-heading {{
+                color: #245A9A;
+                background: #E7F0FC;
+                border-left: 5px solid #4787C7;
+                border-bottom: 1px solid #C5D9F0;
+            }}
+
+            .worked-example-heading {{
+                color: #70449C;
+                background: #F1E9FB;
+                border-left: 5px solid #9163BC;
+                border-bottom: 1px solid #D9C9EC;
+            }}
+
+            /* TABLES */
 
             table {{
                 width: 100%;
@@ -1051,10 +1027,7 @@ def create_document_html(
                 color: #263D62;
             }}
 
-
-            /* ==========================================
-               IMPORTANT NOTES
-            ========================================== */
+            /* GENERAL BLOCKQUOTES */
 
             blockquote {{
                 margin: 10px 0;
@@ -1071,96 +1044,147 @@ def create_document_html(
                 margin: 2px 0;
             }}
 
+            /* EDUCATIONAL BOX BASE */
 
-            /* ==========================================
-               MATHEMATICAL FORMULA BOXES
-            ========================================== */
-
-            .formula-box {{
+            .formula-box,
+            .reaction-box,
+            .additional-knowledge-box,
+            .new-example-box,
+            .video-example-box,
+            .worked-example-box {{
                 margin: 13px 0;
-                padding: 13px 15px;
-                border: 1.5px solid #4C8ACB;
-                border-left: 5px solid #286DB0;
+                padding: 12px 15px;
                 border-radius: 8px;
-                background: #EAF4FF;
                 break-inside: avoid;
                 page-break-inside: avoid;
             }}
 
-            .formula-box .special-box-label {{
-                color: #245A9A;
+            .special-box-label {{
                 font-size: 8pt;
                 font-weight: 700;
-                letter-spacing: 0.6px;
-                margin-bottom: 8px;
+                letter-spacing: 0.5px;
+                margin-bottom: 7px;
+            }}
+
+            .special-box-content {{
+                font-size: 9.5pt;
+                line-height: 1.75;
+                overflow-wrap: anywhere;
+            }}
+
+            .special-box-content p:last-child {{
+                margin-bottom: 0;
+            }}
+
+            /* FORMULAS */
+
+            .formula-box {{
+                border: 1.5px solid #4C8ACB;
+                border-left: 5px solid #286DB0;
+                background: #EAF4FF;
+            }}
+
+            .formula-box .special-box-label {{
+                color: #245A9A;
             }}
 
             .formula-box .special-box-content {{
                 color: #173F70;
                 font-size: 11pt;
                 font-weight: 600;
-                line-height: 1.8;
-                overflow-wrap: anywhere;
             }}
 
             .formula-box mjx-container {{
                 color: #173F70 !important;
-                max-width: 100%;
-                overflow-x: auto;
-                overflow-y: hidden;
             }}
 
-            .formula-box mjx-container[display="true"] {{
-                margin: 9px 0 !important;
-            }}
-
-
-            /* ==========================================
-               CHEMICAL REACTION BOXES
-            ========================================== */
+            /* CHEMICAL REACTIONS */
 
             .reaction-box {{
-                margin: 13px 0;
-                padding: 13px 15px;
                 border: 1.5px solid #D59B4A;
                 border-left: 5px solid #C47A24;
-                border-radius: 8px;
                 background: #FFF5E7;
-                break-inside: avoid;
-                page-break-inside: avoid;
             }}
 
             .reaction-box .special-box-label {{
                 color: #A55D16;
-                font-size: 8pt;
-                font-weight: 700;
-                letter-spacing: 0.6px;
-                margin-bottom: 8px;
             }}
 
             .reaction-box .special-box-content {{
                 color: #75420F;
                 font-size: 11pt;
                 font-weight: 600;
-                line-height: 1.8;
-                overflow-wrap: anywhere;
             }}
 
             .reaction-box mjx-container {{
                 color: #75420F !important;
-                max-width: 100%;
-                overflow-x: auto;
-                overflow-y: hidden;
             }}
 
-            .reaction-box mjx-container[display="true"] {{
-                margin: 9px 0 !important;
+            /* ADDITIONAL KNOWLEDGE */
+
+            .additional-knowledge-box {{
+                border: 1px solid #A8DCD3;
+                border-left: 5px solid #23978B;
+                background: #EDFAF7;
             }}
 
+            .additional-knowledge-box .special-box-label {{
+                color: #176B68;
+            }}
 
-            /* ==========================================
-               GENERAL MATHEMATICAL EXPRESSIONS
-            ========================================== */
+            .additional-knowledge-box .special-box-content {{
+                color: #285E5A;
+            }}
+
+            /* NEW ILLUSTRATIVE EXAMPLES */
+
+            .new-example-box {{
+                border: 1px solid #F0D19C;
+                border-left: 5px solid #E5A13C;
+                background: #FFF8EA;
+            }}
+
+            .new-example-box .special-box-label {{
+                color: #925A1D;
+            }}
+
+            .new-example-box .special-box-content {{
+                color: #74532C;
+            }}
+
+            /* VIDEO EXAMPLES */
+
+            .video-example-box {{
+                border: 1px solid #C4D9F1;
+                border-left: 5px solid #4787C7;
+                background: #F0F6FD;
+            }}
+
+            .video-example-box .special-box-label {{
+                color: #245A9A;
+            }}
+
+            .video-example-box .special-box-content {{
+                color: #385C83;
+            }}
+
+            /* WORKED EXAMPLES */
+
+            .worked-example-box {{
+                border: 1px solid #D7C4EA;
+                border-left: 5px solid #9163BC;
+                background: #F7F1FC;
+            }}
+
+            .worked-example-box .special-box-label {{
+                color: #70449C;
+            }}
+
+            .worked-example-box .special-box-content {{
+                color: #57436D;
+            }}
+
+            /* MATHEMATICAL EXPRESSIONS */
 
             mjx-container {{
                 font-size: 105% !important;
@@ -1168,18 +1192,24 @@ def create_document_html(
             }}
 
             mjx-container[display="true"] {{
+                display: block;
+                max-width: 100%;
+                overflow-x: auto;
+                overflow-y: hidden;
                 margin: 12px 0 !important;
-                padding: 4px 0;
+                padding: 6px 2px;
+            }}
+
+            mjx-container[display="false"] {{
+                display: inline-block;
+                max-width: 100%;
             }}
 
             mjx-container[jax="CHTML"] {{
                 outline: none;
             }}
 
-
-            /* ==========================================
-               CODE
-            ========================================== */
+            /* CODE */
 
             pre, code {{
                 font-family:
@@ -1200,10 +1230,7 @@ def create_document_html(
                 font-size: 8.5pt;
             }}
 
-
-            /* ==========================================
-               DIAGRAMS
-            ========================================== */
+            /* DIAGRAMS */
 
             .diagram {{
                 width: 100%;
@@ -1262,10 +1289,7 @@ def create_document_html(
                 margin-bottom: 12px;
             }}
 
-
-            /* ==========================================
-               PRINT SAFETY
-            ========================================== */
+            /* PRINT SAFETY */
 
             img {{
                 max-width: 100%;
@@ -1280,26 +1304,24 @@ def create_document_html(
                 break-inside: avoid;
             }}
 
-            .cover {{
-                break-inside: avoid;
-            }}
-
+            .cover,
             .formula-box,
-            .reaction-box {{
+            .reaction-box,
+            .additional-knowledge-box,
+            .new-example-box,
+            .video-example-box,
+            .worked-example-box {{
                 break-inside: avoid;
                 page-break-inside: avoid;
             }}
 
         </style>
-
     </head>
 
     <body>
-
         <div class="paper">
 
             <header class="cover">
-
                 <h1>{safe_title}</h1>
 
                 <p class="subtitle">
@@ -1309,21 +1331,15 @@ def create_document_html(
                 <p class="subtitle">
                     Complete Video Study Notes
                 </p>
-
             </header>
 
             <main>
-
                 {notes_html}
-
                 {appendix_html}
-
             </main>
 
         </div>
-
     </body>
-
     </html>
     """
 
@@ -1336,37 +1352,62 @@ def create_document_html(
 
 def render_mathjax(page):
     """
-    Wait for MathJax and typeset mathematical expressions.
+    Wait for MathJax and typeset all mathematical expressions.
 
-    MathJax is loaded from its CDN. If the CDN is unreachable,
-    the PDF can still be generated, but raw LaTeX may remain
-    unrendered. The caller can inspect the returned status.
+    Returns True if MathJax loads and typesets successfully.
     """
 
     try:
-
         page.wait_for_function(
             """
             () => (
                 window.MathJax &&
+                window.MathJax.startup &&
+                window.MathJax.startup.promise &&
                 typeof window.MathJax.typesetPromise === "function"
             )
             """,
-            timeout=20000,
+            timeout=30000,
         )
 
         page.evaluate(
             """
             async () => {
                 await window.MathJax.startup.promise;
+
                 await window.MathJax.typesetPromise();
+
+                await document.fonts.ready;
             }
             """
         )
 
-        return True
+        result = page.evaluate(
+            """
+            () => ({
+                loaded: !!window.MathJax,
 
-    except Exception:
+                rendered: document.querySelectorAll(
+                    'mjx-container'
+                ).length,
+
+                errors: document.querySelectorAll(
+                    'mjx-merror'
+                ).length
+            })
+            """
+        )
+
+        print("MathJax rendering result:", result)
+
+        return (
+            result["loaded"]
+            and result["rendered"] > 0
+            and result["errors"] == 0
+        )
+
+    except Exception as error:
+        print(f"MathJax rendering failed: {error}")
         return False
 
 
@@ -1407,15 +1448,9 @@ def create_study_notes_pdf(
     diagram_images = diagram_images or []
 
     if not isinstance(diagram_images, list):
-        raise ValueError(
-            "diagram_images must be a list."
-        )
+        raise ValueError("diagram_images must be a list.")
 
-    for index, diagram in enumerate(
-        diagram_images,
-        start=1,
-    ):
-
+    for index, diagram in enumerate(diagram_images, start=1):
         if not isinstance(diagram, dict):
             raise ValueError(
                 f"Diagram {index} must be a dictionary."
@@ -1441,11 +1476,9 @@ def create_study_notes_pdf(
     )
 
     with sync_playwright() as playwright:
-
         browser = playwright.chromium.launch()
 
         try:
-
             page = browser.new_page(
                 viewport={
                     "width": 1240,
@@ -1460,12 +1493,10 @@ def create_study_notes_pdf(
                 timeout=45000,
             )
 
-            # Wait for local embedded fonts.
             page.evaluate(
                 "() => document.fonts.ready"
             )
 
-            # Wait for embedded images.
             page.evaluate(
                 """async () => {
                     const images = Array.from(document.images);
@@ -1485,22 +1516,30 @@ def create_study_notes_pdf(
                 }"""
             )
 
-            # Render mathematical expressions.
             math_rendered = render_mathjax(page)
 
-            # Allow layout to settle after MathJax typesetting.
             page.evaluate(
-                "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+                "() => new Promise(resolve => "
+                "requestAnimationFrame(() => "
+                "requestAnimationFrame(resolve)))"
             )
+
+            if not math_rendered and re.search(
+                r"\\\(|\\\[|\$\$",
+                notes,
+            ):
+                print(
+                    "WARNING: MathJax could not successfully "
+                    "render the mathematical expressions. "
+                    "Check internet access and the LaTeX syntax."
+                )
 
             pdf_bytes = page.pdf(
                 format="A4",
                 print_background=True,
                 prefer_css_page_size=True,
                 display_header_footer=True,
-
                 header_template="<div></div>",
-
                 footer_template="""
                     <div style="
                         width: 100%;
@@ -1513,7 +1552,6 @@ def create_study_notes_pdf(
                         of <span class="totalPages"></span>
                     </div>
                 """,
-
                 margin={
                     "top": "12mm",
                     "right": "14mm",
@@ -1521,16 +1559,6 @@ def create_study_notes_pdf(
                     "left": "19mm",
                 },
             )
-
-            if not math_rendered and re.search(
-                r"\\\(|\\\[",
-                notes,
-            ):
-                print(
-                    "WARNING: MathJax could not be loaded. "
-                    "Mathematical expressions may remain in LaTeX form. "
-                    "Check internet access to the MathJax CDN."
-                )
 
         finally:
             browser.close()

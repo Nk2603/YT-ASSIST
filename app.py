@@ -1,16 +1,17 @@
+
 import html
 import base64
 import os
 import re
 import json
-import textwrap
 import tempfile
 from io import BytesIO
 from pathlib import Path
+from operator import itemgetter
 
 import streamlit as st
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 from langchain_groq import ChatGroq
 from langchain_community.document_loaders import YoutubeLoader
@@ -18,7 +19,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+from langchain_core.runnables import RunnableParallel, RunnableLambda
 from langchain_core.prompts import PromptTemplate
 
 from pdf_generator import create_study_notes_pdf
@@ -40,26 +41,18 @@ DEFAULT_YOUTUBE_URL = YOUTUBE_URL
 EMBEDDING_MODEL = "gemini-embedding-001"
 LLM_MODEL = "openai/gpt-oss-120b"
 
-# RAG settings
 CHUNK_SIZE = 1800
 CHUNK_OVERLAP = 150
 RETRIEVER_K = 5
 
-# Notes settings
 SUMMARY_CHUNK_SIZE = 7500
 SUMMARY_CHUNK_OVERLAP = 250
 SUMMARIES_PER_NOTES_BATCH = 3
 MAX_CHAT_QUESTIONS = 15
 
-# Standard diagram settings
 MAX_DIAGRAMS = 5
 MAX_DIAGRAM_NODES = 8
-DIAGRAM_WIDTH = 1500
-DIAGRAM_NODE_HEIGHT = 150
-DIAGRAM_VERTICAL_GAP = 95
 
-# Premium video analysis settings
-# These are reserved for a future Premium Notes workflow.
 MAX_VIDEO_FRAMES = 18
 MAX_VIDEO_DOWNLOAD_MB = 180
 MAX_FRAME_WIDTH = 1200
@@ -84,42 +77,71 @@ def get_llm():
 
     if not api_key:
         raise EnvironmentError(
-            "GROQ_API_KEY is missing. "
-            "Add it to your .env file."
+            "GROQ_API_KEY is missing. Add it to your .env file."
         )
 
     return ChatGroq(
         model=LLM_MODEL,
         temperature=0.2,
+        api_key=api_key,
     )
 
 
 def response_to_text(response):
-    """Convert LangChain responses into plain text."""
+    """
+    Safely converts different LLM response formats into plain text.
+    Supports strings, dictionaries, AIMessage objects and content blocks.
+    """
 
-    content = getattr(response, "content", response)
+    if response is None:
+        return ""
 
-    if isinstance(content, str):
-        return content.strip()
+    # Direct string response
+    if isinstance(response, str):
+        return response.strip()
 
-    if isinstance(content, list):
+    # Dictionary response
+    if isinstance(response, dict):
+        for key in ("answer", "output", "text", "content"):
+            value = response.get(key)
+
+            if value is not None:
+                return response_to_text(value)
+
+        return str(response)
+
+    # LangChain AIMessage or similar objects
+    content = getattr(response, "content", None)
+
+    if content is not None:
+        return response_to_text(content)
+
+    # List of content blocks
+    if isinstance(response, (list, tuple)):
         parts = []
 
-        for item in content:
+        for item in response:
             if isinstance(item, str):
                 parts.append(item)
 
             elif isinstance(item, dict):
-                item_text = item.get("text")
+                text_value = item.get("text")
 
-                if item_text:
-                    parts.append(str(item_text))
+                if isinstance(text_value, str):
+                    parts.append(text_value)
 
-        return "\n".join(parts).strip()
+                elif text_value is not None:
+                    parts.append(response_to_text(text_value))
 
-    return str(content).strip() if content else ""
+            else:
+                item_text = getattr(item, "text", None)
 
+                if isinstance(item_text, str):
+                    parts.append(item_text)
 
+        return "\n".join(part for part in parts if part).strip()
+
+    return str(response)
 # ============================================================
 # YOUTUBE TRANSCRIPT
 # ============================================================
@@ -127,7 +149,7 @@ def response_to_text(response):
 def load_transcript(youtube_url):
     """Load the available English or Hindi YouTube transcript."""
 
-    if not youtube_url or not youtube_url.strip():
+    if not isinstance(youtube_url, str) or not youtube_url.strip():
         raise ValueError("Please provide a valid YouTube URL.")
 
     loader = YoutubeLoader.from_youtube_url(
@@ -144,31 +166,46 @@ def load_transcript(youtube_url):
             "Check whether captions are available for this video."
         )
 
-    if not any(
-        document.page_content.strip()
+    valid_documents = [
+        document
         for document in documents
-    ):
+        if (
+            hasattr(document, "page_content")
+            and isinstance(document.page_content, str)
+            and document.page_content.strip()
+        )
+    ]
+
+    if not valid_documents:
         raise ValueError("The video transcript is empty.")
 
-    return documents
+    return valid_documents
 
 
 def format_docs(documents):
-    return "\n\n".join(
-        document.page_content
-        for document in documents
-    )
+    """Combine retrieved LangChain documents into text."""
+
+    if not isinstance(documents, (list, tuple)):
+        return str(documents or "")
+
+    contents = []
+
+    for document in documents:
+        page_content = getattr(document, "page_content", None)
+
+        if isinstance(page_content, str) and page_content.strip():
+            contents.append(page_content.strip())
+
+    return "\n\n".join(contents)
+
 
 def normalize_youtube_url(youtube_url):
-    """
-    Normalize common YouTube URL formats so the same video
-    can be identified consistently across quiz generations.
-    """
+    """Normalize common YouTube URL formats."""
 
     if not youtube_url:
         return ""
 
-    url = youtube_url.strip()
+    url = str(youtube_url).strip()
 
     patterns = [
         r"(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})",
@@ -180,7 +217,10 @@ def normalize_youtube_url(youtube_url):
         match = re.search(pattern, url)
 
         if match:
-            return f"https://www.youtube.com/watch?v={match.group(1)}"
+            return (
+                "https://www.youtube.com/watch?v="
+                f"{match.group(1)}"
+            )
 
     return url
 
@@ -188,9 +228,48 @@ def normalize_youtube_url(youtube_url):
 # ============================================================
 # RAG QUESTION-ANSWERING PIPELINE
 # ============================================================
+def normalize_rag_input(value):
+    """
+    Normalize RAG input so the chain accepts either:
+    - A plain question string
+    - A dictionary containing question and chat_history
+    """
 
+    if isinstance(value, str):
+        question = value.strip()
+        chat_history = "No previous conversation."
+
+    elif isinstance(value, dict):
+        question = value.get("question", "")
+        chat_history = value.get(
+            "chat_history",
+            "No previous conversation."
+        )
+
+        if not isinstance(question, str):
+            raise ValueError("The question must be a string.")
+
+        question = question.strip()
+
+        if not isinstance(chat_history, str):
+            chat_history = str(chat_history)
+
+    else:
+        raise ValueError(
+            "Invalid RAG input. Expected a question string "
+            "or a dictionary."
+        )
+
+    if not question:
+        raise ValueError("Please enter a question.")
+
+    return {
+        "question": question,
+        "chat_history": chat_history,
+    }
+    
 def initialize_rag_chain(youtube_url):
-    """Create the transcript-based FAISS retrieval chain."""
+    """Create a transcript-based FAISS retrieval chain."""
 
     documents = load_transcript(youtube_url)
 
@@ -204,20 +283,19 @@ def initialize_rag_chain(youtube_url):
 
     if not chunks:
         raise ValueError(
-            "The transcript could not be divided "
-            "into searchable sections."
+            "The transcript could not be divided into searchable sections."
         )
 
     google_api_key = os.getenv("GOOGLE_API_KEY")
 
     if not google_api_key:
         raise EnvironmentError(
-            "GOOGLE_API_KEY is missing. "
-            "Add it to your .env file."
+            "GOOGLE_API_KEY is missing. Add it to your .env file."
         )
 
     embeddings = GoogleGenerativeAIEmbeddings(
         model=EMBEDDING_MODEL,
+        google_api_key=google_api_key,
     )
 
     vectorstore = FAISS.from_documents(
@@ -232,40 +310,147 @@ def initialize_rag_chain(youtube_url):
 
     prompt = PromptTemplate.from_template(
         """
-You are a helpful YouTube video-learning assistant.
+You are an expert educational tutor and YouTube video-learning assistant.
 
-Answer the user's question using the supplied transcript context.
+Your job is to help the student understand concepts deeply,
+not merely repeat the transcript.
 
-Rules:
-- Use the transcript as your primary source.
-- Use general knowledge when it helps explain a concept,
-  but clearly distinguish it from information in the video.
-- Do not invent quotations or claim that the video said something
-  when it is not present in the transcript.
-- If something is not covered in the transcript, explain that.
-- Respond in the same language as the user's question.
-- Use simple English, Hindi, or natural Hinglish.
-- Explain technical terms clearly.
-- Use examples when they improve understanding.
-- Include useful facts or additional context when relevant.
-- Structure longer answers with headings and bullet points.
-- Use mathematical notation for formulas when appropriate.
-- Preserve chemical formulas and reaction coefficients.
-
-Transcript context:
+CURRENT VIDEO TRANSCRIPT CONTEXT:
 {context}
 
-Question:
+RECENT CONVERSATION:
+{chat_history}
+
+CURRENT STUDENT QUESTION:
 {question}
 
-Answer:
+==================================================
+1. SOURCE ACCURACY
+==================================================
+
+- Use the retrieved transcript as the primary source for video-specific claims.
+- Never claim that the video mentioned something unless supported by the transcript.
+- If the transcript does not cover a requested detail, say so clearly.
+- You may use reliable foundational knowledge to explain missing concepts.
+- Clearly label supplementary explanations as "Additional Knowledge".
+- Do not present uncertain information as established fact.
+- Do not invent quotations, statistics, formulas or experimental results.
+
+==================================================
+2. FRESH EXAMPLES
+==================================================
+
+When the student requests an example, a new example, another example,
+or an illustration:
+
+- Create a fresh, original illustrative example.
+- Do not simply repeat examples from the video.
+- Avoid repeating examples already used in recent conversation.
+- Prefer different contexts, values, scenarios or applications.
+- Clearly label it "New Illustrative Example".
+- Explain why the example demonstrates the concept.
+- If the student asks for multiple examples, make them meaningfully different.
+
+For numerical examples:
+
+1. State the given values.
+2. Identify the required quantity.
+3. Write the relevant formula.
+4. Explain the variables.
+5. Substitute the values.
+6. Show the calculation step by step.
+7. State the final answer with units, where applicable.
+8. Verify whether the result is reasonable.
+
+Never invent source-specific numerical values.
+Clearly identify hypothetical values used in illustrative examples.
+
+==================================================
+3. TEACHING APPROACH
+==================================================
+
+- Explain difficult concepts in simple language.
+- Explain technical terms before using them extensively.
+- Break complicated concepts into logical steps.
+- Explain why each step occurs, not just what happens.
+- Use practical applications and analogies when helpful.
+- Connect new concepts with previously explained concepts.
+- Correct misconceptions when necessary.
+- Do not unnecessarily repeat the same explanation.
+
+==================================================
+4. VISUAL AND STRUCTURED REPRESENTATIONS
+==================================================
+
+Choose a representation according to the concept.
+
+Possible representations:
+
+- Comparison tables for differences.
+- Numbered stages for sequential processes.
+- Block or architecture diagrams for system components.
+- Concept maps for relationships between ideas.
+- Equations and worked calculations for numerical concepts.
+- Pseudocode for algorithms.
+- Input-process-output tables for computational systems.
+
+Use a visual representation only when it genuinely improves understanding.
+
+For diagrams:
+
+- Use only meaningful and logically connected components.
+- Explain the purpose of important components.
+- Explain the direction of information or process flow.
+- Do not invent components or relationships.
+- Keep labels understandable.
+
+When a diagram is not suitable, use a table or structured explanation instead.
+
+==================================================
+5. RESPONSE STRUCTURE
+==================================================
+
+For a detailed conceptual question, use this structure when appropriate:
+
+1. Direct Answer
+2. Explanation
+3. How It Works
+4. Suitable Representation
+5. New Illustrative Example
+6. Additional Knowledge
+7. Key Takeaway
+
+Do not force every heading into short answers.
+
+==================================================
+6. LANGUAGE
+==================================================
+
+Respond in the same language as the student's question.
+
+Use:
+- Simple English.
+- Natural Hindi in Devanagari.
+- Natural Hinglish.
+
+Keep standard technical terms in English where appropriate.
+
+Avoid unnecessarily complex vocabulary.
+
+Now answer the student's current question accurately and helpfully.
 """
     )
 
     chain = (
-        RunnableParallel({
-            "context": retriever | format_docs,
-            "question": RunnablePassthrough(),
+        RunnableLambda(normalize_rag_input)
+        | RunnableParallel({
+            "context": (
+                itemgetter("question")
+                | retriever
+                | format_docs
+            ),
+            "question": itemgetter("question"),
+            "chat_history": itemgetter("chat_history"),
         })
         | prompt
         | get_llm()
@@ -274,24 +459,31 @@ Answer:
 
     return chain
 
-
 # ============================================================
 # CHAT HISTORY HELPERS
 # ============================================================
 
 def get_user_questions(chat_history):
+    """Return valid user questions from chat history."""
+
     if not isinstance(chat_history, list):
         return []
 
-    return [
-        str(message.get("content", "")).strip()
-        for message in chat_history
-        if (
-            isinstance(message, dict)
-            and message.get("role") == "user"
-            and str(message.get("content", "")).strip()
-        )
-    ]
+    questions = []
+
+    for message in chat_history:
+        if not isinstance(message, dict):
+            continue
+
+        if message.get("role") != "user":
+            continue
+
+        content = message.get("content", "")
+
+        if isinstance(content, str) and content.strip():
+            questions.append(content.strip())
+
+    return questions
 
 
 def build_questions_context(chat_history):
@@ -307,6 +499,67 @@ def build_questions_context(chat_history):
         f"- {question}"
         for question in questions[-MAX_CHAT_QUESTIONS:]
     )
+
+
+def format_recent_chat_history(chat_history, max_messages=8):
+    """Format recent conversation messages for contextual answers."""
+
+    if not isinstance(chat_history, list):
+        return "No previous conversation."
+
+    recent_messages = chat_history[-max_messages:]
+    formatted = []
+
+    for message in recent_messages:
+        if not isinstance(message, dict):
+            continue
+
+        role = str(message.get("role", "")).lower()
+        content = message.get("content", "")
+
+        if not isinstance(content, str):
+            continue
+
+        content = content.strip()
+
+        if role not in {"user", "assistant"} or not content:
+            continue
+
+        content = content[:1800]
+
+        label = "Student" if role == "user" else "Assistant"
+        formatted.append(f"{label}: {content}")
+
+    return "\n\n".join(formatted) or "No previous conversation."
+
+
+def clean_chat_history(chat_history):
+    """Return only valid user and assistant messages."""
+
+    if not isinstance(chat_history, list):
+        return []
+
+    cleaned = []
+
+    for message in chat_history:
+        if not isinstance(message, dict):
+            continue
+
+        role = message.get("role")
+        content = message.get("content")
+
+        if role not in {"user", "assistant"}:
+            continue
+
+        if not isinstance(content, str) or not content.strip():
+            continue
+
+        cleaned.append({
+            "role": role,
+            "content": content.strip(),
+        })
+
+    return cleaned
 
 
 # ============================================================
@@ -337,66 +590,36 @@ Avoid excessively informal language.
     }
 
     if language not in instructions:
-        raise ValueError(
-            f"Unsupported language: {language}"
-        )
+        raise ValueError(f"Unsupported language: {language}")
 
     return instructions[language]
 
+
 def get_diagram_language_instruction(language):
-    """
-    Diagram label language:
-    English  -> English
-    Hindi    -> Hindi (Devanagari)
-    Hinglish -> English
-    """
+    """Return the required language for diagram labels."""
 
     instructions = {
         "English": """
 Write ALL diagram text in clear English.
-
-This includes:
-- Diagram title
-- Node labels
-- Node descriptions
-- Connection labels
-- Diagram descriptions
-
 Do not use Hindi or Hinglish.
 """,
 
         "Hindi": """
 Write ALL diagram text in natural Hindi using Devanagari script.
-
-This includes:
-- Diagram title
-- Node labels
-- Node descriptions
-- Connection labels
-- Diagram descriptions
-
 Standard technical terms such as API, CPU, RAM, Database,
-Machine Learning and HTTP may remain in English where appropriate.
-
+Machine Learning and HTTP may remain in English.
 Do not write Hindi using Roman letters.
 """,
 
         "Hinglish": """
 Write ALL diagram text in clear English.
-
-This includes:
-- Diagram title
-- Node labels
-- Node descriptions
-- Connection labels
-- Diagram descriptions
-
-Even though the study notes are in Hinglish,
-diagram labels must remain in English.
-"""
+Diagram labels must remain in English.
+""",
     }
 
     return instructions.get(language, instructions["English"])
+
+
 # ============================================================
 # TRANSCRIPT SUMMARIZATION
 # ============================================================
@@ -407,7 +630,11 @@ def summarize_transcript(documents, llm):
     full_text = "\n\n".join(
         document.page_content.strip()
         for document in documents
-        if document.page_content.strip()
+        if (
+            hasattr(document, "page_content")
+            and isinstance(document.page_content, str)
+            and document.page_content.strip()
+        )
     )
 
     if not full_text:
@@ -526,62 +753,151 @@ def generate_notes_batch(
     )
 
     prompt = f"""
-You are an expert teacher and academic study-notes writer.
+You are an expert teacher, technical educator and academic
+study-notes writer.
 
 Create detailed, accurate and student-friendly study notes
-from the supplied video summaries.
+from the supplied YouTube video summaries.
 
 This is NOTES SECTION {batch_number} OF {total_batches}.
 
 LANGUAGE:
 {get_language_instruction(language)}
-DIAGRAM LABEL LANGUAGE RULES:
 
+DIAGRAM LABEL LANGUAGE:
 {get_diagram_language_instruction(language)}
 
-IMPORTANT:
-Every human-readable text field in the generated diagram JSON
-must follow the diagram language rules above.
+==================================================
+1. SOURCE AND KNOWLEDGE SEPARATION
+==================================================
 
-This applies to:
-- title
-- related_heading
-- description
-- every node label
-- every node details field
-- every connection label
+Organize information into two clearly distinguishable categories.
 
-Node IDs must remain short ASCII identifiers.
-Do not translate node IDs.
+A. VIDEO EXPLANATION
 
-CONTENT REQUIREMENTS:
-1. Cover important concepts.
-2. Explain concepts clearly and accurately.
-3. Include definitions and working principles.
-4. Include important examples.
-5. Preserve technical terminology.
-6. Explain processes logically.
-7. Include mathematical formulas and their meanings.
-8. Include important chemical reactions.
-9. Include important facts and numerical values.
-10. Include useful examination points.
-11. Do not invent unsupported information.
-12. Avoid unnecessary repetition.
+- Include concepts, definitions, facts and examples supported
+  by the supplied video summaries.
+- Preserve the original meaning.
+- Do not attribute outside information to the video.
 
-FORMATTING:
+B. ADDITIONAL KNOWLEDGE
+
+- Add useful foundational explanations where they improve
+  understanding of a topic.
+- Explain important prerequisites and missing conceptual links.
+- Add relevant applications and practical context.
+- Clearly mark this content using:
+
+  **Additional Knowledge:**
+
+- Do not claim that this information was explained in the video.
+- Do not add unrelated information merely to increase note length.
+- Avoid unsupported statistics and uncertain claims.
+
+==================================================
+2. EXAMPLES
+==================================================
+
+Include relevant examples that make difficult concepts easier.
+
+Use these labels:
+
+**Video Example:**
+For an example actually supported by the video.
+
+**New Illustrative Example:**
+For a newly created example that is not claimed to be from the video.
+
+For new examples:
+
+- Use realistic and understandable situations.
+- Prefer examples different from the video's examples.
+- Explain the concept demonstrated by the example.
+- Explain the important steps.
+- Avoid repeating the same example in multiple sections.
+
+For numerical examples, include:
+
+1. Given values.
+2. Required quantity.
+3. Formula.
+4. Meaning of variables.
+5. Substitution.
+6. Step-by-step calculation.
+7. Final answer and units.
+8. Brief interpretation.
+
+Clearly label hypothetical values.
+
+Do not invent experimental results or source-specific numerical facts.
+
+==================================================
+3. CONCEPTUAL EXPLANATIONS
+==================================================
+
+For every important topic:
+
+- Explain what it is.
+- Explain why it is needed.
+- Explain how it works.
+- Describe its important components.
+- Explain relationships between components.
+- Include advantages, limitations or applications
+  where relevant.
+- Explain important technical terms.
+- Include comparisons where they improve understanding.
+
+Avoid unnecessarily long explanations of simple topics.
+
+==================================================
+4. VISUAL REPRESENTATIONS
+==================================================
+
+Use a suitable representation when it genuinely improves learning.
+
+Possible representations:
+
+- Architecture diagrams.
+- Block diagrams.
+- Process diagrams.
+- Concept maps.
+- Comparison tables.
+- Input-process-output representations.
+- Numbered workflows.
+- Mathematical derivations.
+- Worked numerical examples.
+
+Do not force a diagram into every topic.
+
+For a complex process, explain its stages in the correct order.
+
+For an architecture, explain the role of each component
+and how the components interact.
+
+For comparisons, prefer a clear Markdown table.
+
+Do not create ASCII diagrams or Mermaid flowcharts in the notes.
+
+Do not invent components, relationships or process stages.
+
+==================================================
+5. FORMATTING
+==================================================
+
 - Use Markdown headings.
-- Use # for the main document topic only when appropriate.
 - Use ## for main topics.
 - Use ### for subtopics.
 - Use short, readable paragraphs.
 - Use bullet points where helpful.
 - Use bold for important terms.
 - Use Markdown tables for comparisons.
-- Do not create ASCII diagrams.
-- Do not create Mermaid flowcharts.
-- Do not add a repeated cover title.
+- Do not create a repeated cover title.
+- Avoid unnecessary repetition between sections.
 
-MATHEMATICAL FORMULAS:
+==================================================
+6. MATHEMATICAL FORMULAS
+==================================================
+
 - Use proper LaTeX notation.
 - Put important standalone formulas inside display math delimiters.
 - Use \\[ ... \\] for display equations.
@@ -590,65 +906,70 @@ MATHEMATICAL FORMULAS:
 - Use ^ for superscripts.
 - Use _ for subscripts.
 - Preserve roots, Greek letters and mathematical operators.
-- Do not flatten fractions into ordinary text.
-- Explain every important variable after the formula.
-- Never change the original mathematical meaning.
+- Explain every important variable.
+- Preserve the original mathematical meaning.
+- Never fabricate a formula.
 
-Example:
+==================================================
+7. CHEMICAL REACTIONS
+==================================================
 
-[FORMULA]
-\\[
-F = ma
-\\]
-
-Where:
-- F = Force
-- m = Mass
-- a = Acceleration
-
-CHEMICAL REACTIONS:
-- Use proper chemical notation.
-- Preserve subscripts and superscripts.
+- Preserve chemical formulas and subscripts.
 - Preserve coefficients and reaction arrows.
-- Use LaTeX chemistry notation where appropriate.
+- Preserve reaction conditions when mentioned.
+- Use proper chemical notation.
 - Put important reactions in separate reaction blocks.
 - Use the [REACTION] marker before a reaction block.
-- Explain reactants, products and important conditions.
-- Explain catalysts or temperature conditions when mentioned.
+- Explain reactants, products and conditions.
 - Never invent a reaction.
-- Never silently change a chemical equation.
-- Do not balance a reaction unless the source provides a balanced equation
-  or explicitly asks for balancing.
+- Never silently change an equation.
 
-Example:
+==================================================
+8. EXAMINATION PREPARATION
+==================================================
 
-> [REACTION]
-> \\(2H_2 + O_2 \\rightarrow 2H_2O\\)
+Include where relevant:
 
-Explanation:
-- Reactants: Hydrogen and oxygen.
-- Product: Water.
-- Coefficients: 2, 1 and 2.
+- Important definitions.
+- Key facts.
+- Differences between related concepts.
+- Important formulas.
+- Applications.
+- Common misconceptions.
+- Important points that students should remember.
 
-FORMULA AND REACTION EXPLANATIONS:
-- Keep explanations outside the formula or reaction expression.
-- Explain symbols, variables, units and conditions.
-- Do not omit important explanations.
+Do not turn every topic into a list of examination questions.
 
-IMPORTANT:
-- This section will be combined with other sections.
-- Do not write a general introduction unless appropriate.
-- Do not write a final conclusion for the complete video.
-- Avoid repeating earlier sections.
-- Make this section understandable independently.
+==================================================
+9. STUDENT QUESTIONS
+==================================================
 
-STUDENT QUESTIONS:
+Use these questions to identify topics that deserve additional
+explanation or examples:
+
 {questions_context}
 
-VIDEO SUMMARIES:
+==================================================
+10. VIDEO SUMMARIES
+==================================================
+
 {summary_text}
 
-Generate only Markdown notes.
+==================================================
+FINAL QUALITY CHECK
+==================================================
+
+Before returning the notes, check:
+
+- Are video-supported facts separated from supplementary knowledge?
+- Are newly created examples clearly labelled?
+- Are important concepts explained rather than merely named?
+- Are formulas and reactions preserved accurately?
+- Are numerical examples solved step by step?
+- Are tables and diagrams appropriate for their topics?
+- Is unnecessary repetition avoided?
+
+Generate only the Markdown notes for this section.
 """
 
     response = llm.invoke(prompt)
@@ -665,23 +986,24 @@ Generate only Markdown notes.
 def generate_notes_from_summaries(
     summaries,
     llm,
-    language,
-    chat_history,
+    language="English",
+    chat_history=None,
 ):
+    """Generate complete study notes from transcript summaries."""
 
     if not summaries:
-        raise ValueError("No transcript summaries are available.")
+        raise ValueError("No transcript summaries were provided.")
 
-    batches = [
-        summaries[index:index + SUMMARIES_PER_NOTES_BATCH]
-        for index in range(
-            0,
-            len(summaries),
-            SUMMARIES_PER_NOTES_BATCH,
-        )
-    ]
+    if language not in SUPPORTED_LANGUAGES:
+        raise ValueError(f"Unsupported language: {language}")
 
+    chat_history = clean_chat_history(chat_history or [])
     questions_context = build_questions_context(chat_history)
+
+    total_batches = (
+        len(summaries) + SUMMARIES_PER_NOTES_BATCH - 1
+    ) // SUMMARIES_PER_NOTES_BATCH
+
     generated_sections = []
 
     progress = st.progress(
@@ -690,46 +1012,46 @@ def generate_notes_from_summaries(
     )
 
     try:
-        for index, batch in enumerate(batches):
+        for batch_index in range(total_batches):
 
-            section_notes = generate_notes_batch(
+            start = batch_index * SUMMARIES_PER_NOTES_BATCH
+            end = start + SUMMARIES_PER_NOTES_BATCH
+
+            summary_batch = summaries[start:end]
+
+            section = generate_notes_batch(
                 llm=llm,
-                summary_batch=batch,
-                batch_number=index + 1,
-                total_batches=len(batches),
+                summary_batch=summary_batch,
+                batch_number=batch_index + 1,
+                total_batches=total_batches,
                 language=language,
                 questions_context=questions_context,
             )
 
-            generated_sections.append(
-                section_notes.strip()
-            )
+            if not section.strip():
+                raise ValueError(
+                    f"Notes section {batch_index + 1} is empty."
+                )
+
+            generated_sections.append(section.strip())
 
             progress.progress(
-                (index + 1) / len(batches),
+                (batch_index + 1) / total_batches,
                 text=(
-                    f"Writing study notes: "
-                    f"{index + 1}/{len(batches)} sections"
+                    f"Generating notes: "
+                    f"{batch_index + 1}/{total_batches} sections"
                 ),
             )
 
     finally:
         progress.empty()
 
-    combined_notes = "\n\n".join(generated_sections)
+    complete_notes = "\n\n".join(generated_sections)
 
-    combined_notes = re.sub(
-        r"\n{3,}",
-        "\n\n",
-        combined_notes,
-    ).strip()
+    if not complete_notes.strip():
+        raise ValueError("Study notes generation returned empty content.")
 
-    if not combined_notes:
-        raise ValueError(
-            "The generated study notes are empty."
-        )
-
-    return combined_notes
+    return complete_notes
 
 
 # ============================================================
@@ -771,7 +1093,7 @@ def extract_note_headings(notes):
 def extract_json_from_response(response_text):
     """Extract JSON from model output, including fenced responses."""
 
-    if not response_text:
+    if not isinstance(response_text, str) or not response_text.strip():
         return None
 
     cleaned = response_text.strip()
@@ -794,26 +1116,15 @@ def extract_json_from_response(response_text):
     except json.JSONDecodeError:
         pass
 
-    start_positions = [
-        position
-        for position in (
-            cleaned.find("{"),
-            cleaned.find("["),
-        )
-        if position >= 0
-    ]
+    decoder = json.JSONDecoder()
 
-    if not start_positions:
-        return None
-
-    start = min(start_positions)
-
-    for end in range(len(cleaned), start, -1):
-
-        candidate = cleaned[start:end].strip()
+    for index, character in enumerate(cleaned):
+        if character not in "{[":
+            continue
 
         try:
-            return json.loads(candidate)
+            result, _ = decoder.raw_decode(cleaned[index:])
+            return result
         except json.JSONDecodeError:
             continue
 
@@ -830,12 +1141,7 @@ def generate_diagram_specifications(
     language,
     visual_context="",
 ):
-    """
-    Generate simple, topic-specific diagram specifications.
-
-    Standard Notes uses transcript/notes content only.
-    No Gemini Vision or YouTube frame extraction is used.
-    """
+    """Generate simple, topic-specific diagram specifications."""
 
     headings = extract_note_headings(notes)
 
@@ -852,6 +1158,9 @@ Create a small number of useful diagrams for the study notes.
 LANGUAGE:
 {get_language_instruction(language)}
 
+DIAGRAM LABEL LANGUAGE:
+{get_diagram_language_instruction(language)}
+
 NOTES:
 {notes[:18000]}
 
@@ -859,24 +1168,38 @@ MAIN TOPICS:
 {headings_text}
 
 DIAGRAM REQUIREMENTS:
+
 - Generate at most {MAX_DIAGRAMS} diagrams.
 - Generate diagrams only when they genuinely improve understanding.
-- Use simple process diagrams, architecture diagrams,
-  block diagrams or basic concept diagrams.
-- Use only information supported by the notes.
-- Do not create scientific illustrations.
-- Do not create biological specimen drawings.
-- Do not create molecular structure illustrations.
-- Do not create decorative diagrams.
-- Do not create generic diagrams unrelated to the topic.
-- Do not invent components or process steps.
+- Select the representation appropriate to the topic.
+
+Representation selection:
+
+1. PROCESS:
+   Use for sequential operations, workflows and procedures.
+
+2. ARCHITECTURE:
+   Use for systems containing multiple interacting components.
+
+3. BLOCK:
+   Use for input-process-output systems and functional components.
+
+4. CONCEPT:
+   Use for relationships between concepts and their subtopics.
+
+- Use only information supported by the supplied notes.
+- Supplementary knowledge may be represented only if it is
+  explicitly included in the notes.
+- Do not invent components or connections.
+- Preserve correct process order.
+- Show meaningful relationships.
 - Keep node labels short and readable.
 - Use a maximum of {MAX_DIAGRAM_NODES} nodes per diagram.
-- Each diagram must match a specific notes heading.
-- Use connections to show meaningful relationships.
-- For processes, preserve the correct order.
-- For architecture, show meaningful component relationships.
-- For concept diagrams, show the main concept and its subtopics.
+- Match each diagram to a specific notes heading.
+- Do not generate decorative or unrelated diagrams.
+- Do not force a diagram for a simple definition.
+- Prefer a comparison table or written explanation when a diagram
+  would not improve understanding.
 
 Return valid JSON only.
 
@@ -1047,7 +1370,7 @@ Return JSON only. Do not use Markdown code fences.
                 "direction": direction,
                 "nodes": nodes,
                 "connections": valid_connections,
-                "source": "Pillow-generated educational diagram",
+                "source": "AI-generated educational diagram",
             })
 
             if len(validated) >= MAX_DIAGRAMS:
@@ -1063,19 +1386,12 @@ Return JSON only. Do not use Markdown code fences.
         return []
 
 
-
-
 # ============================================================
 # BROWSER-BASED DIAGRAM RENDERING
-# Supports English, Hindi (Devanagari), and Hinglish labels.
-# Chromium handles complex text shaping without Pillow RAQM.
 # ============================================================
 
 def get_diagram_font_css():
-    """
-    Embed available Noto fonts directly into the HTML.
-    This avoids depending on fonts installed on the user's system.
-    """
+    """Embed available Noto fonts directly into the HTML."""
 
     font_definitions = [
         ("NotoSans", "NotoSans-Regular.ttf", "400"),
@@ -1128,12 +1444,10 @@ def _safe_diagram_text(value):
 
 
 def build_diagram_html(specification):
-    """
-    Build a self-contained HTML diagram.
+    """Build a self-contained HTML diagram."""
 
-    All diagram text is rendered by Chromium rather than Pillow.
-    The original diagram specification structure is preserved.
-    """
+    if not isinstance(specification, dict):
+        return None
 
     title = _safe_diagram_text(
         specification.get("title", "Concept Diagram")
@@ -1160,13 +1474,11 @@ def build_diagram_html(specification):
     if not isinstance(connections, list):
         connections = []
 
-    # Limit the diagram to the configured maximum.
-    nodes = nodes[:8]
+    nodes = nodes[:MAX_DIAGRAM_NODES]
 
     if not nodes:
         return None
 
-    # Keep node IDs stable and safe for HTML attributes.
     node_ids = set()
     cleaned_nodes = []
 
@@ -1175,8 +1487,6 @@ def build_diagram_html(specification):
             continue
 
         node_id = str(node.get("id", f"node_{index + 1}"))
-
-        # IDs are used only for connecting nodes.
         node_id = re.sub(r"[^a-zA-Z0-9_-]", "_", node_id)
 
         if not node_id:
@@ -1202,7 +1512,6 @@ def build_diagram_html(specification):
     if not nodes:
         return None
 
-    # Layout selection.
     if direction == "horizontal" and diagram_type == "process":
         columns = min(len(nodes), 4)
     elif diagram_type in ("architecture", "concept"):
@@ -1212,7 +1521,6 @@ def build_diagram_html(specification):
 
     columns = max(1, columns)
 
-    # Only retain connections whose endpoints exist.
     valid_connections = []
 
     for connection in connections:
@@ -1252,7 +1560,7 @@ def build_diagram_html(specification):
 
     connections_json = json.dumps(
         valid_connections,
-        ensure_ascii=False
+        ensure_ascii=False,
     )
 
     font_css = get_diagram_font_css()
@@ -1393,7 +1701,10 @@ def build_diagram_html(specification):
         <div id="diagram">
             <div class="diagram-title">{title}</div>
 
-            {f'<div class="diagram-description">{description}</div>' if description else ''}
+            {
+                f'<div class="diagram-description">{description}</div>'
+                if description else ''
+            }
 
             <div class="diagram-canvas" id="diagram-canvas">
 
@@ -1436,14 +1747,14 @@ def build_diagram_html(specification):
 
                 const canvasRect = canvas.getBoundingClientRect();
 
-                svg.setAttribute("viewBox",
+                svg.setAttribute(
+                    "viewBox",
                     `0 0 ${{canvasRect.width}} ${{canvasRect.height}}`
                 );
 
                 svg.setAttribute("width", canvasRect.width);
                 svg.setAttribute("height", canvasRect.height);
 
-                // Keep the arrow marker.
                 svg.innerHTML = `
                     <defs>
                         <marker
@@ -1504,7 +1815,10 @@ def build_diagram_html(specification):
                     line.setAttribute("y2", y2);
                     line.setAttribute("stroke", "#6676ad");
                     line.setAttribute("stroke-width", "3");
-                    line.setAttribute("marker-end", "url(#arrowhead)");
+                    line.setAttribute(
+                        "marker-end",
+                        "url(#arrowhead)"
+                    );
 
                     svg.appendChild(line);
 
@@ -1515,16 +1829,21 @@ def build_diagram_html(specification):
                         );
 
                         text.setAttribute(
-                            "x", (x1 + x2) / 2
+                            "x",
+                            (x1 + x2) / 2
                         );
 
                         text.setAttribute(
-                            "y", (y1 + y2) / 2 - 9
+                            "y",
+                            (y1 + y2) / 2 - 9
                         );
 
-                        text.setAttribute("class", "connection-label");
-                        text.textContent = connection.label;
+                        text.setAttribute(
+                            "class",
+                            "connection-label"
+                        );
 
+                        text.textContent = connection.label;
                         svg.appendChild(text);
                     }}
                 }});
@@ -1533,7 +1852,6 @@ def build_diagram_html(specification):
             window.addEventListener("load", async () => {{
                 await document.fonts.ready;
 
-                // Wait for the browser to finish laying out the cards.
                 requestAnimationFrame(() => {{
                     drawConnections();
                 }});
@@ -1545,9 +1863,7 @@ def build_diagram_html(specification):
 
 
 def render_single_diagram(specification, page=None):
-    """
-    Render one diagram as PNG bytes using Chromium.
-    """
+    """Render one diagram as PNG bytes using Chromium."""
 
     from playwright.sync_api import sync_playwright
 
@@ -1560,7 +1876,7 @@ def render_single_diagram(specification, page=None):
         page.set_content(
             html_document,
             wait_until="load",
-            timeout=30000
+            timeout=30000,
         )
 
         page.evaluate("""
@@ -1574,21 +1890,24 @@ def render_single_diagram(specification, page=None):
 
         return page.locator("#diagram").screenshot(
             type="png",
-            animations="disabled"
+            animations="disabled",
         )
 
-    # Standalone fallback if this function is called independently.
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
-        page = browser.new_page(
-            viewport={"width": 1200, "height": 1000},
-            device_scale_factor=2
-        )
 
         try:
-            page.set_content(html_document, wait_until="load")
+            standalone_page = browser.new_page(
+                viewport={"width": 1200, "height": 1000},
+                device_scale_factor=2,
+            )
 
-            page.evaluate("""
+            standalone_page.set_content(
+                html_document,
+                wait_until="load",
+            )
+
+            standalone_page.evaluate("""
                 async () => {
                     await document.fonts.ready;
                     await new Promise(resolve =>
@@ -1597,9 +1916,9 @@ def render_single_diagram(specification, page=None):
                 }
             """)
 
-            return page.locator("#diagram").screenshot(
+            return standalone_page.locator("#diagram").screenshot(
                 type="png",
-                animations="disabled"
+                animations="disabled",
             )
 
         finally:
@@ -1607,11 +1926,7 @@ def render_single_diagram(specification, page=None):
 
 
 def render_diagrams(diagrams):
-    """
-    Render diagram specifications while preserving the existing
-    output structure expected by generate_study_material()
-    and pdf_generator.py.
-    """
+    """Render diagram specifications using Playwright Chromium."""
 
     if not diagrams:
         return []
@@ -1620,76 +1935,69 @@ def render_diagrams(diagrams):
 
     from playwright.sync_api import sync_playwright
 
-    browser = None
-
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch()
 
-            page = browser.new_page(
-                viewport={"width": 1200, "height": 1000},
-                device_scale_factor=2
-            )
+            try:
+                page = browser.new_page(
+                    viewport={"width": 1200, "height": 1000},
+                    device_scale_factor=2,
+                )
 
-            for index, specification in enumerate(
-                diagrams[:5],
-                start=1
-            ):
-                try:
-                    image_bytes = render_single_diagram(
-                        specification,
-                        page=page
-                    )
+                for index, specification in enumerate(
+                    diagrams[:MAX_DIAGRAMS],
+                    start=1,
+                ):
+                    try:
+                        image_bytes = render_single_diagram(
+                            specification,
+                            page=page,
+                        )
 
-                    if not image_bytes:
-                        continue
+                        if not image_bytes:
+                            continue
 
-                    rendered_diagrams.append({
-                        "number": index,
-                        "title": specification.get(
-                            "title",
-                            f"Diagram {index}"
-                        ),
-                        "related_heading": specification.get(
-                            "related_heading",
-                            ""
-                        ),
-                        "description": specification.get(
-                            "description",
-                            ""
-                        ),
-                        "diagram_type": specification.get(
-                            "diagram_type",
-                            "concept"
-                        ),
-                        "visual_type": specification.get(
-                            "diagram_type",
-                            "concept"
-                        ),
-                        "nodes": specification.get("nodes", []),
-                        "connections": specification.get(
-                            "connections",
-                            []
-                        ),
-                        "image": image_bytes,
-                        "source": "AI-generated concept illustration",
-                    })
+                        rendered_diagrams.append({
+                            "number": index,
+                            "title": specification.get(
+                                "title",
+                                f"Diagram {index}",
+                            ),
+                            "related_heading": specification.get(
+                                "related_heading",
+                                "",
+                            ),
+                            "description": specification.get(
+                                "description",
+                                "",
+                            ),
+                            "diagram_type": specification.get(
+                                "diagram_type",
+                                "concept",
+                            ),
+                            "visual_type": specification.get(
+                                "diagram_type",
+                                "concept",
+                            ),
+                            "nodes": specification.get("nodes", []),
+                            "connections": specification.get(
+                                "connections",
+                                [],
+                            ),
+                            "image": image_bytes,
+                            "source": "AI-generated concept illustration",
+                        })
 
-                except Exception as error:
-                    print(
-                        f"Diagram {index} rendering failed: {error}"
-                    )
+                    except Exception as error:
+                        print(
+                            f"Diagram {index} rendering failed: {error}"
+                        )
 
-            browser.close()
-            browser = None
+            finally:
+                browser.close()
 
     except Exception as error:
-        if browser:
-            try:
-                browser.close()
-            except Exception:
-                pass
-
         st.warning(
             "Diagram rendering could not be completed. "
             "Please check that Playwright Chromium is installed. "
@@ -1697,6 +2005,7 @@ def render_diagrams(diagrams):
         )
 
     return rendered_diagrams
+
 
 def parse_diagram_material(raw_output):
     """Compatibility helper for older code."""
@@ -1707,28 +2016,14 @@ def parse_diagram_material(raw_output):
         return result
 
     if isinstance(result, dict):
-        return result.get("diagrams", [])
+        diagrams = result.get("diagrams", [])
+        return diagrams if isinstance(diagrams, list) else []
 
     return []
 
 
 # ============================================================
 # PREMIUM VIDEO FRAME ANALYSIS
-# ============================================================
-#
-# IMPORTANT:
-# These functions are intentionally isolated.
-#
-# Standard Notes does NOT call these functions.
-#
-# They are reserved for a future Premium Notes workflow:
-# - Original YouTube frame extraction.
-# - Gemini visual analysis.
-# - Selection of useful original video visuals.
-#
-# Dependencies are imported only when these functions are
-# explicitly called. This avoids unnecessary dependencies and
-# import overhead in the Standard Notes workflow.
 # ============================================================
 
 def extract_video_frames_premium(youtube_url):
@@ -1764,9 +2059,7 @@ def extract_video_frames_premium(youtube_url):
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
-            "max_filesize": (
-                MAX_VIDEO_DOWNLOAD_MB * 1024 * 1024
-            ),
+            "max_filesize": MAX_VIDEO_DOWNLOAD_MB * 1024 * 1024,
             "socket_timeout": 20,
             "retries": 1,
         }
@@ -1781,7 +2074,6 @@ def extract_video_frames_premium(youtube_url):
                 )
 
             if not os.path.exists(video_path):
-
                 candidates = list(
                     Path(temp_dir).glob("premium_video.*")
                 )
@@ -1842,7 +2134,6 @@ def extract_video_frames_premium(youtube_url):
                 )
 
                 if scale < 1:
-
                     frame = cv2.resize(
                         frame,
                         (
@@ -1874,12 +2165,7 @@ def extract_video_frames_premium(youtube_url):
 
 
 def analyze_video_frames_premium(frames, notes):
-    """
-    Analyse original video frames with Gemini.
-
-    This function is reserved for Premium Notes.
-    It is not called by generate_study_material().
-    """
+    """Analyse original video frames with Gemini."""
 
     if not frames:
         return []
@@ -1902,6 +2188,7 @@ def analyze_video_frames_premium(frames, notes):
     vision_llm = ChatGoogleGenerativeAI(
         model=VISION_MODEL,
         temperature=0.1,
+        google_api_key=os.getenv("GOOGLE_API_KEY"),
     )
 
     headings = extract_note_headings(notes)
@@ -1948,8 +2235,6 @@ If nothing is useful, return:
         "text": prompt,
     }]
 
-    import base64
-
     for index, frame in enumerate(frames, start=1):
 
         encoded = base64.b64encode(
@@ -1980,7 +2265,8 @@ If nothing is useful, return:
     )
 
     if isinstance(result, dict):
-        return result.get("frames", [])
+        frame_results = result.get("frames", [])
+        return frame_results if isinstance(frame_results, list) else []
 
     return []
 
@@ -2022,12 +2308,8 @@ def select_relevant_video_visuals_premium(
             continue
 
         try:
-            confidence = float(
-                item.get("confidence", 0)
-            )
-            frame_number = int(
-                item.get("frame_number", 0)
-            )
+            confidence = float(item.get("confidence", 0))
+            frame_number = int(item.get("frame_number", 0))
         except (TypeError, ValueError):
             continue
 
@@ -2044,10 +2326,7 @@ def select_relevant_video_visuals_premium(
         frame = frames[frame_number - 1]
 
         try:
-            with Image.open(
-                BytesIO(frame["image"])
-            ) as image:
-
+            with Image.open(BytesIO(frame["image"])) as image:
                 output = BytesIO()
 
                 image.convert("RGB").save(
@@ -2062,11 +2341,13 @@ def select_relevant_video_visuals_premium(
             continue
 
         title = str(
-            item.get(
-                "related_heading",
-                "Video Visual",
-            )
+            item.get("related_heading", "Video Visual")
         ).strip()
+
+        visible_labels = item.get("visible_labels", [])
+
+        if not isinstance(visible_labels, list):
+            visible_labels = []
 
         selected.append({
             "number": len(selected) + 1,
@@ -2080,10 +2361,7 @@ def select_relevant_video_visuals_premium(
                 frame["timestamp"]
             ),
             "image": png_bytes,
-            "visible_labels": item.get(
-                "visible_labels",
-                [],
-            ),
+            "visible_labels": visible_labels,
             "source": "Original YouTube video frame",
         })
 
@@ -2114,7 +2392,6 @@ def extract_notes_title(notes):
         )
 
         if match:
-
             title = re.sub(
                 r"[*_`]",
                 "",
@@ -2158,45 +2435,36 @@ def generate_study_material(
     """
     Generate Standard Notes and a notebook-style PDF.
 
-    STANDARD WORKFLOW:
+    Workflow:
     1. Load transcript.
     2. Summarize transcript.
     3. Generate detailed study notes.
     4. Generate diagram specifications using Groq.
-    5. Render diagrams using Pillow.
+    5. Render diagrams using Playwright Chromium.
     6. Generate the PDF.
-
-    Gemini Vision and original video frame extraction
-    are intentionally excluded from this workflow.
 
     Returns:
         notes, rendered_diagrams, pdf_bytes
     """
 
     if language not in SUPPORTED_LANGUAGES:
-        raise ValueError(
-            f"Unsupported language: {language}"
-        )
+        raise ValueError(f"Unsupported language: {language}")
 
-    if not youtube_url or not youtube_url.strip():
+    if not isinstance(youtube_url, str) or not youtube_url.strip():
         raise ValueError("Please provide a YouTube URL.")
 
-    # STEP 1: Load transcript.
-    with st.spinner(
-        "Loading the YouTube transcript..."
-    ):
+    chat_history = clean_chat_history(chat_history or [])
+
+    with st.spinner("Loading the YouTube transcript..."):
         documents = load_transcript(youtube_url)
 
-    # STEP 2: Initialize Groq.
     llm = get_llm()
 
-    # STEP 3: Summarize transcript.
     summaries = summarize_transcript(
         documents,
         llm,
     )
 
-    # STEP 4: Generate study notes.
     notes = generate_notes_from_summaries(
         summaries=summaries,
         llm=llm,
@@ -2205,34 +2473,21 @@ def generate_study_material(
     )
 
     if not notes.strip():
-        raise ValueError(
-            "The generated study notes are empty."
-        )
+        raise ValueError("The generated study notes are empty.")
 
-    # STEP 5: Generate diagram specifications.
-    with st.spinner(
-        "Designing topic-specific educational diagrams..."
-    ):
+    with st.spinner("Designing topic-specific educational diagrams..."):
         diagram_specs = generate_diagram_specifications(
             llm=llm,
             notes=notes,
             language=language,
         )
 
-    # STEP 6: Render diagrams with Pillow.
-    with st.spinner(
-        "Drawing diagrams using Pillow..."
-    ):
-        rendered_diagrams = render_diagrams(
-            diagram_specs
-        )
+    with st.spinner("Rendering educational diagrams in Chromium..."):
+        rendered_diagrams = render_diagrams(diagram_specs)
 
-    # STEP 7: Generate PDF.
     notes_title = extract_notes_title(notes)
 
-    with st.spinner(
-        "Preparing your notebook-style PDF..."
-    ):
+    with st.spinner("Preparing your notebook-style PDF..."):
         pdf_bytes = create_study_notes_pdf(
             notes=notes,
             title=notes_title,
@@ -2254,10 +2509,10 @@ def generate_study_material(
         pdf_bytes,
     )
 
+
 # ============================================================
 # QUIZ GENERATION INTEGRATION
 # ============================================================
-
 
 def generate_video_quiz(
     youtube_url,
@@ -2275,23 +2530,22 @@ def generate_video_quiz(
     - Generated study notes
     - Learner chat history
     - Previously generated questions
-
-    Previous questions are supplied to quiz_generation.py
-    to reduce repetition across quiz attempts.
     """
 
-    if not youtube_url or not youtube_url.strip():
+    if not isinstance(youtube_url, str) or not youtube_url.strip():
         raise ValueError("Please provide a valid YouTube URL.")
 
     if language not in SUPPORTED_LANGUAGES:
         raise ValueError(
-            f"Unsupported quiz language: {language}"
+            "Invalid quiz language."
         )
 
     try:
         question_count = int(question_count)
     except (TypeError, ValueError):
-        raise ValueError("Question count must be a valid integer.")
+        raise ValueError(
+            "Question count must be a valid integer."
+        )
 
     if not 1 <= question_count <= 30:
         raise ValueError(
@@ -2303,41 +2557,31 @@ def generate_video_quiz(
     if difficulty not in {"Easy", "Medium", "Hard", "Mixed"}:
         raise ValueError("Invalid quiz difficulty.")
 
-    # Normalize previous question history.
     cleaned_previous_questions = []
 
     if isinstance(previous_questions, (list, tuple)):
         for item in previous_questions:
 
             if isinstance(item, dict):
-                question_text = str(
-                    item.get("question", "")
-                ).strip()
+                question_text = item.get("question", "")
 
             else:
-                question_text = str(item).strip()
+                question_text = item
 
-            if question_text:
+            if isinstance(question_text, str) and question_text.strip():
                 cleaned_previous_questions.append(
-                    question_text[:1000]
+                    question_text.strip()[:1000]
                 )
 
-    # Avoid passing an unnecessarily large history to the LLM.
     cleaned_previous_questions = (
         cleaned_previous_questions[-150:]
     )
 
-    # Load the complete transcript.
-    documents = load_transcript(
-        youtube_url.strip()
-    )
-
+    documents = load_transcript(youtube_url.strip())
     transcript = format_docs(documents)
 
     if not transcript.strip():
-        raise ValueError(
-            "The YouTube transcript is empty."
-        )
+        raise ValueError("The YouTube transcript is empty.")
 
     llm = get_llm()
 
@@ -2345,7 +2589,7 @@ def generate_video_quiz(
         llm=llm,
         transcript=transcript,
         notes=notes or "",
-        chat_history=chat_history or [],
+        chat_history=clean_chat_history(chat_history or []),
         language=language,
         question_count=question_count,
         difficulty=difficulty,
@@ -2358,22 +2602,24 @@ def generate_video_quiz(
             "Quiz generation returned an invalid response."
         )
 
-    if not isinstance(quiz.get("questions"), list):
+    questions = quiz.get("questions")
+
+    if not isinstance(questions, list):
         raise ValueError(
             "Quiz generation did not return a valid question list."
         )
 
-    if len(quiz["questions"]) != question_count:
+    if len(questions) != question_count:
         raise ValueError(
             f"Expected {question_count} questions, "
-            f"but received {len(quiz['questions'])}."
+            f"but received {len(questions)}."
         )
 
-    quiz["source_url"] = normalize_youtube_url(
-        youtube_url
-    )
+    quiz["source_url"] = normalize_youtube_url(youtube_url)
 
     return quiz
+
+
 # ============================================================
 # COMPATIBILITY ALIAS
 # ============================================================
@@ -2413,9 +2659,13 @@ def main():
     }
 
     for key, value in defaults.items():
-
         if key not in st.session_state:
             st.session_state[key] = value
+
+    # Ensure the session history always has a safe structure.
+    st.session_state.chat_history = clean_chat_history(
+        st.session_state.chat_history
+    )
 
     st.title("📚 YT-RAG-Assist")
 
@@ -2427,22 +2677,29 @@ def main():
     youtube_url = st.text_input(
         "YouTube video URL",
         value=DEFAULT_YOUTUBE_URL,
+        key="youtube_url_input",
     ).strip()
 
     language = st.selectbox(
         "Study notes language",
         ["English", "Hindi", "Hinglish"],
+        key="study_language",
     )
 
     if not youtube_url:
         st.warning("Enter a YouTube URL to continue.")
         return
 
-    # Reset data when the video URL changes.
-    if (
-        st.session_state.loaded_url is not None
-        and st.session_state.loaded_url != youtube_url
-    ):
+    # --------------------------------------------------------
+    # RESET WHEN VIDEO URL CHANGES
+    # --------------------------------------------------------
+
+    current_url = normalize_youtube_url(youtube_url)
+    loaded_url = normalize_youtube_url(
+        st.session_state.loaded_url or ""
+    )
+
+    if loaded_url and loaded_url != current_url:
 
         st.session_state.rag_chain = None
         st.session_state.loaded_url = None
@@ -2451,7 +2708,10 @@ def main():
         st.session_state.generated_notes = None
         st.session_state.generated_diagrams = []
 
-    # Load transcript for RAG.
+    # --------------------------------------------------------
+    # LOAD VIDEO FOR RAG
+    # --------------------------------------------------------
+
     if st.button(
         "Load video for questions",
         type="secondary",
@@ -2473,63 +2733,94 @@ def main():
             st.success("Video loaded successfully.")
 
         except Exception as exc:
-            st.error(
-                f"Could not load the video: {exc}"
-            )
+            st.error(f"Could not load the video: {exc}")
 
     # --------------------------------------------------------
     # CHAT INTERFACE
     # --------------------------------------------------------
 
-    if (
+    video_is_loaded = (
         st.session_state.rag_chain is not None
-        and st.session_state.loaded_url == youtube_url
-    ):
+        and normalize_youtube_url(
+            st.session_state.loaded_url or ""
+        ) == current_url
+    )
+
+    if video_is_loaded:
 
         st.subheader("Ask questions")
 
+        # Display previous conversation safely.
         for message in st.session_state.chat_history:
 
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
+            if not isinstance(message, dict):
+                continue
+
+            role = message.get("role")
+            content = message.get("content", "")
+
+            if role not in {"user", "assistant"}:
+                continue
+
+            if not isinstance(content, str):
+                continue
+
+            with st.chat_message(role):
+                st.markdown(content)
 
         question = st.chat_input(
             "Ask something about the video..."
         )
 
-        if question:
+        # Invoke the RAG chain only after a valid question is submitted.
+        if question and question.strip():
+
+            question = question.strip()
 
             with st.chat_message("user"):
                 st.markdown(question)
 
             try:
                 with st.chat_message("assistant"):
+                    with st.spinner("Searching the transcript..."):
 
-                    with st.spinner(
-                        "Searching the transcript..."
-                    ):
+                        response = st.session_state.rag_chain.invoke({
+                            "question": question,
+                            "chat_history": format_recent_chat_history(
+                                st.session_state.chat_history
+                            ),
+                        })
 
-                        answer = st.session_state.rag_chain.invoke(
-                            question
-                        )
+                        answer = response_to_text(response)
+
+                    if not answer:
+                        answer = "I couldn't generate a response. Please try again."
 
                     st.markdown(answer)
 
                 st.session_state.chat_history.extend([
-                    {
-                        "role": "user",
-                        "content": question,
-                    },
-                    {
-                        "role": "assistant",
-                        "content": answer,
-                    },
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": answer},
                 ])
 
-            except Exception as exc:
-                st.error(
-                    f"Could not answer the question: {exc}"
+            except Exception as e:
+                import traceback
+
+                st.error(f"Could not generate an answer: {e}")
+
+                st.subheader("Complete Error Traceback")
+
+                st.code(
+                    traceback.format_exc(),
+                    language="python"
                 )
+
+                print("FULL ERROR TRACEBACK:")
+                traceback.print_exc()
+    else:
+        st.info(
+            "Load the video first to start asking questions."
+        )
 
     # --------------------------------------------------------
     # STUDY MATERIAL GENERATION
@@ -2540,8 +2831,9 @@ def main():
     st.subheader("Generate complete study material")
 
     st.write(
-        "Create detailed notes with highlighted formulas, "
-        "chemical reactions and Pillow-generated diagrams."
+        "Create comprehensive study notes with video-based explanations, "
+        "additional conceptual knowledge, fresh illustrative examples, "
+        "worked calculations, highlighted formulas and topic-specific diagrams."
     )
 
     if st.button(
@@ -2550,7 +2842,6 @@ def main():
     ):
 
         try:
-
             notes, diagrams, pdf_bytes = generate_study_material(
                 youtube_url=youtube_url,
                 chat_history=st.session_state.chat_history,
@@ -2573,8 +2864,15 @@ def main():
             )
 
         except Exception as exc:
+            import traceback
+
             st.error(
                 f"Study material generation failed: {exc}"
+            )
+
+            st.code(
+                traceback.format_exc(),
+                language="text",
             )
 
     # --------------------------------------------------------
@@ -2598,7 +2896,7 @@ def main():
             for diagram in st.session_state.generated_diagrams:
 
                 st.markdown(
-                    f"**{diagram['title']}**"
+                    f"**{diagram.get('title', 'Diagram')}**"
                 )
 
                 if diagram.get("description"):
@@ -2606,10 +2904,11 @@ def main():
                         diagram["description"]
                     )
 
-                st.image(
-                    diagram["image"],
-                    use_container_width=True,
-                )
+                if diagram.get("image"):
+                    st.image(
+                        diagram["image"],
+                        use_container_width=True,
+                    )
 
         else:
             st.info(
